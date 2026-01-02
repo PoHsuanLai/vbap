@@ -1,0 +1,16 @@
+[package]
+name = "vbap"
+version = "0.1.0"
+edition = "2021"
+description = "Vector Base Amplitude Panning for spatial audio"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/PoHsuanLai/vbap"
+keywords = ["audio", "panning", "spatial", "vbap", "surround"]
+categories = ["multimedia::audio"]
+rust-version = "1.70"
+
+[dependencies]
+glam = "0.30"
+
+[dev-dependencies]
+approx = "0.5"
