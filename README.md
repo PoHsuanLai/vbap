@@ -3,8 +3,11 @@
 [![CI](https://github.com/PoHsuanLai/vbap/actions/workflows/ci.yml/badge.svg)](https://github.com/PoHsuanLai/vbap/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/vbap.svg)](https://crates.io/crates/vbap)
 [![docs.rs](https://docs.rs/vbap/badge.svg)](https://docs.rs/vbap)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE-MIT)
 
-Vector Base Amplitude Panning for Rust. Inspired by [Ardour](https://ardour.org/).
+[Vector Base Amplitude Panning](https://www.audiolabs-erlangen.de/media/pages/resources/aps-w23/papers/935eb793db-1663358804/sap_Pulkki1997.pdf) (VBAP) positions virtual sound sources in a speaker array by computing gain coefficients for the 2-3 speakers nearest to the source direction. Originally described by Ville Pulkki in 1997.
+
+Inspired by [Ardour](https://ardour.org/)'s implementation.
 
 ## Usage
 
@@ -45,4 +48,4 @@ let panner = VBAPanner::builder()
 
 ## License
 
-MIT OR Apache-2.0
+MIT
