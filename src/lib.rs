@@ -67,11 +67,17 @@
 //! - **Azimuth**: 0° = front center, 90° = left, -90° = right, 180° = rear
 //! - **Elevation**: 0° = horizontal, 90° = above, -90° = below
 //!
+//! This follows the counter-clockwise positive convention defined in
+//! [ITU-R BS.2076](https://www.itu.int/dms_pubrec/itu-r/rec/bs/R-REC-BS.2076-2-201910-S!!PDF-E.pdf)
+//! (Audio Definition Model) and the
+//! [EBU ADM Guidelines](https://adm.ebu.io/reference/excursions/coordinate_system.html):
+//! 0° straight ahead, positive azimuth to the left.
+//!
 //! ## References
 //!
-//! Based on Ville Pulkki's VBAP algorithm:
-//! - Pulkki, V. (1997). "Virtual Sound Source Positioning Using Vector Base Amplitude Panning"
-//! - Implementation adapted from Ardour DAW's panner code
+//! - Pulkki, V. (1997). ["Virtual Sound Source Positioning Using Vector Base Amplitude Panning."](https://www.aes.org/e-lib/browse.cfm?elib=7853)
+//!   *J. Audio Eng. Soc.*, 45(6), 456–466.
+//! - Implementation adapted from [Ardour](https://ardour.org/) DAW's panner code
 
 pub mod config;
 pub mod error;
