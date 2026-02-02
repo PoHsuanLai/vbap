@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 //! # VBAP - Vector Base Amplitude Panning
 //!
 //! A Rust implementation of the Vector Base Amplitude Panning (VBAP) algorithm
@@ -13,6 +14,7 @@
 //! - **Presets**: Common configurations (stereo, 5.1, 7.1, Atmos, etc.)
 //! - **Builder API**: Fluent interface for custom speaker layouts
 //! - **SIMD Optimized**: Uses `glam` for fast vector math
+//! - **`no_std` Compatible**: Works without the standard library (requires `alloc`)
 //!
 //! ## Quick Start
 //!
@@ -78,6 +80,8 @@
 //! - Pulkki, V. (1997). ["Virtual Sound Source Positioning Using Vector Base Amplitude Panning."](https://www.aes.org/e-lib/browse.cfm?elib=7853)
 //!   *J. Audio Eng. Soc.*, 45(6), 456–466.
 //! - Implementation adapted from [Ardour](https://ardour.org/) DAW's panner code
+
+extern crate alloc;
 
 pub mod config;
 pub mod error;

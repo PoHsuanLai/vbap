@@ -1,6 +1,7 @@
 //! Error types for VBAP operations.
 
-use std::fmt;
+use alloc::string::String;
+use core::fmt;
 
 /// Errors that can occur during VBAP configuration and computation.
 #[derive(Debug, Clone, PartialEq)]
@@ -16,18 +17,6 @@ pub enum VBAPError {
     /// Cannot form valid speaker pairs (2D) or triplets (3D).
     /// This can happen if speakers are too close together or all collinear.
     InvalidConfiguration(String),
-
-    /// Azimuth or elevation angle is out of valid range.
-    InvalidAngle {
-        /// Name of the angle parameter.
-        parameter: &'static str,
-        /// The invalid value provided.
-        value: f64,
-        /// Minimum valid value.
-        min: f64,
-        /// Maximum valid value.
-        max: f64,
-    },
 }
 
 impl fmt::Display for VBAPError {
@@ -43,23 +32,12 @@ impl fmt::Display for VBAPError {
             VBAPError::InvalidConfiguration(msg) => {
                 write!(f, "invalid speaker configuration: {}", msg)
             }
-            VBAPError::InvalidAngle {
-                parameter,
-                value,
-                min,
-                max,
-            } => {
-                write!(
-                    f,
-                    "invalid {}: {} (must be between {} and {})",
-                    parameter, value, min, max
-                )
-            }
         }
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for VBAPError {}
 
 /// Result type alias for VBAP operations.
-pub type Result<T> = std::result::Result<T, VBAPError>;
+pub type Result<T> = core::result::Result<T, VBAPError>;

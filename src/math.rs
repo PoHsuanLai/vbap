@@ -14,8 +14,10 @@ use glam::DVec3;
 /// - Elevation 90° = directly above (+Z axis)
 #[inline]
 pub fn spherical_to_cartesian(azimuth: f64, elevation: f64) -> DVec3 {
-    let (azi_sin, azi_cos) = azimuth.to_radians().sin_cos();
-    let (ele_sin, ele_cos) = elevation.to_radians().sin_cos();
+    let azi_rad = azimuth * (core::f64::consts::PI / 180.0);
+    let ele_rad = elevation * (core::f64::consts::PI / 180.0);
+    let (azi_sin, azi_cos) = libm::sincos(azi_rad);
+    let (ele_sin, ele_cos) = libm::sincos(ele_rad);
 
     DVec3::new(
         ele_cos * azi_sin, // X: left-right
@@ -34,8 +36,8 @@ pub fn cartesian_to_spherical(v: DVec3) -> (f64, f64) {
         return (0.0, 0.0);
     }
 
-    let elevation = normalized.z.asin().to_degrees();
-    let azimuth = normalized.x.atan2(normalized.y).to_degrees();
+    let elevation = libm::asin(normalized.z) * (180.0 / core::f64::consts::PI);
+    let azimuth = libm::atan2(normalized.x, normalized.y) * (180.0 / core::f64::consts::PI);
 
     (azimuth, elevation)
 }
@@ -126,5 +128,52 @@ mod tests {
             assert_relative_eq!(azi, azi2, epsilon = 1e-9);
             assert_relative_eq!(ele, ele2, epsilon = 1e-9);
         }
+    }
+
+    #[test]
+    fn test_spherical_to_cartesian_down() {
+        let v = spherical_to_cartesian(0.0, -90.0);
+        assert_relative_eq!(v.x, 0.0, epsilon = 1e-10);
+        assert_relative_eq!(v.y, 0.0, epsilon = 1e-10);
+        assert_relative_eq!(v.z, -1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_spherical_to_cartesian_rear() {
+        let v = spherical_to_cartesian(180.0, 0.0);
+        assert_relative_eq!(v.x, 0.0, epsilon = 1e-10);
+        assert_relative_eq!(v.y, -1.0, epsilon = 1e-10);
+        assert_relative_eq!(v.z, 0.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_angle_wraparound() {
+        // 450° should produce the same result as 90°
+        let v_90 = spherical_to_cartesian(90.0, 0.0);
+        let v_450 = spherical_to_cartesian(450.0, 0.0);
+        assert_relative_eq!(v_90.x, v_450.x, epsilon = 1e-10);
+        assert_relative_eq!(v_90.y, v_450.y, epsilon = 1e-10);
+        assert_relative_eq!(v_90.z, v_450.z, epsilon = 1e-10);
+
+        // -270° should also equal 90°
+        let v_neg270 = spherical_to_cartesian(-270.0, 0.0);
+        assert_relative_eq!(v_90.x, v_neg270.x, epsilon = 1e-10);
+        assert_relative_eq!(v_90.y, v_neg270.y, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_cartesian_to_spherical_poles() {
+        // Directly above
+        let (_, ele) = cartesian_to_spherical(DVec3::new(0.0, 0.0, 1.0));
+        assert_relative_eq!(ele, 90.0, epsilon = 1e-9);
+
+        // Directly below
+        let (_, ele) = cartesian_to_spherical(DVec3::new(0.0, 0.0, -1.0));
+        assert_relative_eq!(ele, -90.0, epsilon = 1e-9);
+
+        // Zero vector
+        let (azi, ele) = cartesian_to_spherical(DVec3::ZERO);
+        assert_relative_eq!(azi, 0.0, epsilon = 1e-9);
+        assert_relative_eq!(ele, 0.0, epsilon = 1e-9);
     }
 }

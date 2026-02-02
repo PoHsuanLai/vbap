@@ -22,12 +22,21 @@ name = "glam"
 version = "0.30.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd47b05dddf0005d850e5644cae7f2b14ac3df487979dbfff3b56f20b1a6ae46"
+dependencies = [
+ "libm",
+]
 
 [[package]]
 name = "hound"
 version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
+
+[[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "num-traits"
@@ -40,9 +49,10 @@ dependencies = [
 
 [[package]]
 name = "vbap"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "approx",
  "glam",
  "hound",
+ "libm",
 ]

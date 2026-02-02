@@ -3,6 +3,9 @@
 //! This module provides the main `VBAPanner` struct that computes
 //! speaker gains for a given source position.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::config::{InverseMatrix, PanningMode, SpeakerConfig, SpeakerConfigBuilder};
 use crate::math::spherical_to_cartesian;
 use crate::speaker::Speaker;
@@ -128,7 +131,7 @@ impl VBAPanner {
         // Normalize gains: sqrt(sum of squares) = 1
         let sum_sq: f64 = best_gains[..best_len].iter().map(|g| g * g).sum();
         let norm = if sum_sq > 1e-10 {
-            1.0 / sum_sq.sqrt()
+            1.0 / libm::sqrt(sum_sq)
         } else {
             0.0
         };
@@ -249,5 +252,70 @@ mod tests {
 
         // At least one non-zero gain
         assert!(gains.iter().any(|&g| g > 0.0));
+    }
+
+    #[test]
+    fn test_angle_wraparound() {
+        let panner = VBAPanner::builder().surround_5_1().build().unwrap();
+
+        // 450° should produce same gains as 90°
+        let gains_90 = panner.compute_gains(90.0, 0.0);
+        let gains_450 = panner.compute_gains(450.0, 0.0);
+        for (a, b) in gains_90.iter().zip(gains_450.iter()) {
+            assert_relative_eq!(a, b, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_extreme_elevation() {
+        let panner = VBAPanner::builder().atmos_7_1_4().build().unwrap();
+
+        // Directly above — should still produce valid normalized gains
+        let gains = panner.compute_gains(0.0, 90.0);
+        assert!(gains.iter().all(|&g| g >= 0.0));
+
+        let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
+        assert_relative_eq!(sum_sq, 1.0, epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_minimum_2d_speakers() {
+        // Exactly 2 speakers — minimum for 2D
+        let panner = VBAPanner::builder()
+            .add_speaker(45.0, 0.0)
+            .add_speaker(-45.0, 0.0)
+            .build()
+            .unwrap();
+
+        assert_eq!(panner.num_speakers(), 2);
+        let gains = panner.compute_gains(0.0, 0.0);
+        assert_relative_eq!(gains[0], gains[1], epsilon = 0.01);
+    }
+
+    #[test]
+    fn test_minimum_3d_speakers() {
+        // Exactly 3 speakers with elevation — minimum for 3D
+        let panner = VBAPanner::builder()
+            .add_speaker(0.0, 0.0)
+            .add_speaker(120.0, 0.0)
+            .add_speaker(0.0, 90.0)
+            .build()
+            .unwrap();
+
+        assert_eq!(panner.num_speakers(), 3);
+        assert_eq!(panner.mode(), PanningMode::ThreeD);
+        let gains = panner.compute_gains(0.0, 45.0);
+        assert!(gains.iter().any(|&g| g > 0.0));
+    }
+
+    #[test]
+    fn test_duplicate_speakers_error() {
+        // Two speakers at the same position should fail to form valid pairs
+        let result = VBAPanner::builder()
+            .add_speaker(30.0, 0.0)
+            .add_speaker(30.0, 0.0)
+            .build();
+
+        assert!(result.is_err());
     }
 }

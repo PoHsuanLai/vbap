@@ -1,16 +1,22 @@
 [package]
 name = "vbap"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Vector Base Amplitude Panning for spatial audio"
 license = "MIT"
 repository = "https://github.com/PoHsuanLai/vbap"
+readme = "README.md"
 keywords = ["audio", "panning", "spatial", "vbap", "surround"]
 categories = ["multimedia::audio"]
 rust-version = "1.70"
 
+[features]
+default = ["std"]
+std = ["glam/std"]
+
 [dependencies]
-glam = "0.30"
+glam = { version = "0.30", default-features = false, features = ["nostd-libm"] }
+libm = "0.2"
 
 [dev-dependencies]
 approx = "0.5"

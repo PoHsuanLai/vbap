@@ -4,6 +4,9 @@
 //! including the selection of valid speaker pairs (2D) or triplets (3D)
 //! and the computation of inverse matrices for gain calculation.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::error::{Result, VBAPError};
 use crate::math::lines_intersect;
 use crate::panner::VBAPanner;
@@ -282,13 +285,13 @@ fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
 
             // Compute 2x2 inverse matrix for this pair
             // Matrix columns are speaker direction vectors (sin/cos of azimuth)
-            let azi1_rad = s1.azimuth().to_radians();
-            let azi2_rad = s2.azimuth().to_radians();
+            let azi1_rad = s1.azimuth() * (core::f64::consts::PI / 180.0);
+            let azi2_rad = s2.azimuth() * (core::f64::consts::PI / 180.0);
 
-            let mat = DMat2::from_cols(
-                DVec2::new(azi1_rad.sin(), azi1_rad.cos()),
-                DVec2::new(azi2_rad.sin(), azi2_rad.cos()),
-            );
+            let (sin1, cos1) = libm::sincos(azi1_rad);
+            let (sin2, cos2) = libm::sincos(azi2_rad);
+
+            let mat = DMat2::from_cols(DVec2::new(sin1, cos1), DVec2::new(sin2, cos2));
 
             if mat.determinant().abs() < 1e-10 {
                 return None;
