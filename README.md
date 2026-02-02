@@ -55,6 +55,17 @@ And consistent with the original VBAP paper:
 
 - Pulkki, V. (1997). ["Virtual Sound Source Positioning Using Vector Base Amplitude Panning."](https://www.aes.org/e-lib/browse.cfm?elib=7853) *J. Audio Eng. Soc.*, 45(6), 456–466.
 
+## `no_std` support
+
+This crate works without the standard library. Disable the default `std` feature in your `Cargo.toml`:
+
+```toml
+[dependencies]
+vbap = { version = "0.1.1", default-features = false }
+```
+
+An allocator is still required (`alloc`). The only difference is that `VBAPError` won't implement `std::error::Error`.
+
 ## License
 
 MIT
