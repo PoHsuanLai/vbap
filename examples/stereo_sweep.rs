@@ -46,6 +46,8 @@ fn main() {
     }
 
     writer.finalize().unwrap();
-    println!("Wrote {path} ({duration_secs}s stereo, noise sweeping left ↔ right at {sweep_hz} Hz)");
+    println!(
+        "Wrote {path} ({duration_secs}s stereo, noise sweeping left ↔ right at {sweep_hz} Hz)"
+    );
     println!("Play it with headphones to hear VBAP panning!");
 }
