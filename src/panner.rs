@@ -26,8 +26,9 @@ use glam::DVec2;
 ///     .build()
 ///     .unwrap();
 ///
-/// // Pan a source 15 degrees to the left
-/// let gains = panner.compute_gains(15.0, 0.0);
+/// // Pan a source 15 degrees to the left (alloc-free).
+/// let mut gains = vec![0.0; panner.num_speakers()];
+/// panner.compute_gains_into(15.0, 0.0, &mut gains);
 /// assert_eq!(gains.len(), 2);
 /// ```
 #[derive(Clone, Debug)]
@@ -50,6 +51,10 @@ impl VBAPanner {
 
     /// Compute speaker gains for a source at the given position.
     ///
+    /// Allocates a fresh `Vec<f64>` on every call; not suitable for
+    /// real-time audio threads. Prefer [`VBAPanner::compute_gains_into`]
+    /// with a pre-allocated slice on hot paths.
+    ///
     /// # Arguments
     /// * `azimuth` - Horizontal angle in degrees (0° = front, 90° = left, -90° = right)
     /// * `elevation` - Vertical angle in degrees (0° = horizontal, 90° = above)
@@ -58,6 +63,10 @@ impl VBAPanner {
     /// A vector of gains, one per speaker. Gains are normalized so that
     /// the sum of squared gains equals 1.0. Most gains will be 0.0,
     /// with only 2-3 speakers active (depending on 2D/3D mode).
+    #[deprecated(
+        since = "0.1.2",
+        note = "allocates per call; use `compute_gains_into` with a pre-allocated slice"
+    )]
     pub fn compute_gains(&self, azimuth: f64, elevation: f64) -> Vec<f64> {
         let mut gains = vec![0.0; self.config.num_speakers()];
         self.compute_gains_into(azimuth, elevation, &mut gains);
@@ -171,6 +180,7 @@ impl VBAPanner {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;

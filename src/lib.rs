@@ -27,8 +27,10 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! // Compute gains for a source 15° to the left
-//! let gains = panner.compute_gains(15.0, 0.0);
+//! // Compute gains for a source 15° to the left into a pre-allocated
+//! // slice — the alloc-free path suitable for audio threads.
+//! let mut gains = vec![0.0; panner.num_speakers()];
+//! panner.compute_gains_into(15.0, 0.0, &mut gains);
 //! println!("L: {:.2}, R: {:.2}", gains[0], gains[1]);
 //! ```
 //!
@@ -46,7 +48,8 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! let gains = panner.compute_gains(45.0, 0.0);
+//! let mut gains = vec![0.0; panner.num_speakers()];
+//! panner.compute_gains_into(45.0, 0.0, &mut gains);
 //! ```
 //!
 //! ## 3D Panning (Height Speakers)
@@ -61,7 +64,8 @@
 //!     .unwrap();
 //!
 //! // Elevated source (45° azimuth, 30° elevation)
-//! let gains = panner.compute_gains(45.0, 30.0);
+//! let mut gains = vec![0.0; panner.num_speakers()];
+//! panner.compute_gains_into(45.0, 30.0, &mut gains);
 //! ```
 //!
 //! ## Angle Conventions
