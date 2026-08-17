@@ -98,6 +98,6 @@ pub mod speaker;
 pub use config::{
     Dimension, InverseMatrix, PanningMode, SpeakerConfig, SpeakerConfigBuilder, SpeakerTuple,
 };
-pub use error::{Result, VBAPError};
+pub use error::{PanError, Result, VBAPError};
 pub use panner::VBAPanner;
 pub use speaker::Speaker;

@@ -7,6 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::config::{InverseMatrix, PanningMode, SpeakerConfig, SpeakerConfigBuilder};
+use crate::error::PanError;
 use crate::math::spherical_to_cartesian;
 use crate::speaker::Speaker;
 use glam::DVec2;
@@ -75,19 +76,77 @@ impl VBAPanner {
 
     /// Compute speaker gains into a pre-allocated slice.
     ///
-    /// This avoids allocation when called repeatedly.
+    /// This avoids allocation when called repeatedly, and is the intended entry
+    /// point for audio threads: it allocates nothing, takes no locks, and — in
+    /// release builds — cannot panic.
     ///
-    /// # Panics
-    /// Panics if `gains.len() < self.num_speakers()`.
+    /// # Real-time contract
+    ///
+    /// `gains.len()` must be at least [`num_speakers()`](Self::num_speakers).
+    /// This is checked by a `debug_assert!`, so an undersized slice panics in
+    /// debug builds and is a no-op in release. Prefer
+    /// [`try_compute_gains_into`](Self::try_compute_gains_into) when the length
+    /// is not statically known — unwinding out of an audio callback is
+    /// undefined behaviour under most host ABIs.
+    ///
+    /// # Non-finite input
+    ///
+    /// A NaN or infinite `azimuth`/`elevation` yields all-zero gains rather than
+    /// propagating NaN into the output. This is guaranteed, not incidental.
+    /// Debug builds assert on non-finite input, since it indicates a caller bug.
     #[inline]
     pub fn compute_gains_into(&self, azimuth: f64, elevation: f64, gains: &mut [f64]) {
-        assert!(
+        debug_assert!(
             gains.len() >= self.config.num_speakers(),
             "gains slice too small: {} < {}",
             gains.len(),
             self.config.num_speakers()
         );
+        debug_assert!(
+            azimuth.is_finite() && elevation.is_finite(),
+            "non-finite direction: azimuth={}, elevation={}",
+            azimuth,
+            elevation
+        );
 
+        if gains.len() < self.config.num_speakers() {
+            return;
+        }
+
+        self.compute_gains_unchecked(azimuth, elevation, gains);
+    }
+
+    /// Compute speaker gains into a pre-allocated slice, reporting a slice that
+    /// is too small instead of ignoring it.
+    ///
+    /// Identical to [`compute_gains_into`](Self::compute_gains_into) on success.
+    /// The error type is `Copy` and carries no allocation, so this is safe to
+    /// call from an audio thread.
+    ///
+    /// On error the contents of `gains` are left untouched: a partial write
+    /// would silently drop a speaker's gain and produce a wrong mix.
+    #[inline]
+    pub fn try_compute_gains_into(
+        &self,
+        azimuth: f64,
+        elevation: f64,
+        gains: &mut [f64],
+    ) -> core::result::Result<(), PanError> {
+        let need = self.config.num_speakers();
+        if gains.len() < need {
+            return Err(PanError::BufferTooSmall {
+                need: need as u32,
+                got: gains.len() as u32,
+            });
+        }
+
+        self.compute_gains_unchecked(azimuth, elevation, gains);
+        Ok(())
+    }
+
+    /// Shared implementation. Caller guarantees `gains.len() >= num_speakers()`.
+    #[inline]
+    fn compute_gains_unchecked(&self, azimuth: f64, elevation: f64, gains: &mut [f64]) {
         // Zero out all gains
         gains.fill(0.0);
 
@@ -326,6 +385,56 @@ mod tests {
         assert_eq!(panner.mode(), PanningMode::ThreeD);
         let gains = panner.compute_gains(0.0, 45.0);
         assert!(gains.iter().any(|&g| g > 0.0));
+    }
+
+    #[test]
+    fn test_try_compute_gains_into_rejects_small_slice() {
+        let panner = VBAPanner::builder().surround_5_1().build().unwrap();
+        let mut gains = [0.0; 3];
+
+        let err = panner
+            .try_compute_gains_into(0.0, 0.0, &mut gains)
+            .unwrap_err();
+        assert_eq!(err, PanError::BufferTooSmall { need: 5, got: 3 });
+
+        // The buffer must be left untouched rather than partially written.
+        assert_eq!(gains, [0.0; 3]);
+    }
+
+    #[test]
+    fn test_try_compute_gains_into_matches_infallible() {
+        let panner = VBAPanner::builder().surround_5_1().build().unwrap();
+        let mut a = vec![0.0; 5];
+        let mut b = vec![0.0; 5];
+
+        for azi in [-120.0, -30.0, 0.0, 45.0, 170.0] {
+            panner.compute_gains_into(azi, 0.0, &mut a);
+            panner.try_compute_gains_into(azi, 0.0, &mut b).unwrap();
+            assert_eq!(a, b);
+        }
+    }
+
+    #[test]
+    fn test_non_finite_input_yields_silence() {
+        // Guaranteed behaviour: never leak NaN into the audio buffer.
+        let panner = VBAPanner::builder().surround_5_1().build().unwrap();
+        let mut gains = vec![0.0; 5];
+
+        for (azi, ele) in [
+            (f64::NAN, 0.0),
+            (0.0, f64::NAN),
+            (f64::NAN, f64::NAN),
+            (f64::INFINITY, 0.0),
+            (f64::NEG_INFINITY, 0.0),
+            (0.0, f64::INFINITY),
+        ] {
+            gains.fill(1.0);
+            panner.try_compute_gains_into(azi, ele, &mut gains).unwrap();
+            assert!(
+                gains.iter().all(|g| *g == 0.0),
+                "non-finite input ({azi}, {ele}) produced {gains:?}"
+            );
+        }
     }
 
     #[test]
