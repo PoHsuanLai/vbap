@@ -8,7 +8,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::{Result, VBAPError};
-use crate::math::lines_intersect;
+use crate::math::convex_hull;
 use crate::panner::VBAPanner;
 use crate::presets;
 use crate::speaker::Speaker;
@@ -21,18 +21,24 @@ const MIN_PAIR_ANGLE: f64 = 0.0872665; // ~5 degrees in radians
 /// Approximately 175 degrees.
 const MAX_PAIR_ANGLE: f64 = 3.0543; // π - 0.0873 radians
 
-/// Minimum volume/side ratio for valid 3D triplets.
+/// Tolerance for "this point lies outside that face's plane" during hull
+/// construction.
+const HULL_EPSILON: f64 = 1e-9;
+
+/// A face whose supporting plane passes this close to the listener is
+/// degenerate for VBAP: its basis matrix is singular.
 ///
-/// This exists only to reject triplets that are numerically degenerate (three
-/// speakers so close to a common plane through the origin that the inverse
-/// matrix is unusable). It is deliberately loose: Pulkki (1997) §6.2 reports
-/// that a triangle with sides 5°, 175°, 175° still produces correct gains, and
-/// that with 32-bit accuracy the method "does not set limitations on the
-/// placement of the loudspeakers". That triangle scores ~6.1e-4 here, so the
-/// previous 0.01 threshold rejected geometry the paper explicitly validates.
-/// This crate computes in f64, so it has more headroom than Pulkki's tool, not
-/// less. The determinant check below is the real guard against singular bases.
-const MIN_VOL_P_SIDE_LGTH: f64 = 1e-6;
+/// This subsumes the volume/side-ratio threshold used previously. Pulkki (1997)
+/// §6.2 reports that even a 5°/175°/175° triangle produces correct gains, so the
+/// only geometry that must be rejected is the genuinely singular kind, which is
+/// exactly what this test identifies.
+const ORIGIN_PLANE_EPSILON: f64 = 1e-6;
+
+/// Below this a triangle normal is numerically meaningless.
+const NORMAL_EPSILON_SQ: f64 = 1e-24;
+
+/// Below this a speaker basis matrix is singular.
+const DET_EPSILON: f64 = 1e-10;
 
 /// Panning mode for VBAP computation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,9 +255,14 @@ impl SpeakerConfigBuilder {
         };
 
         if tuples.is_empty() {
-            return Err(VBAPError::InvalidConfiguration(
-                "no valid speaker pairs/triplets could be formed".into(),
-            ));
+            let reason = if mode == PanningMode::ThreeD {
+                "3D panning requires speakers that are not all coplanar with the \
+                 listener; use Dimension::Force2D or add an elevated speaker"
+            } else {
+                "no valid speaker pairs could be formed; check for duplicate or \
+                 antipodal speaker positions"
+            };
+            return Err(VBAPError::InvalidConfiguration(reason.into()));
         }
 
         Ok(SpeakerConfig {
@@ -319,8 +330,16 @@ fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
 
 /// Choose valid speaker triplets for 3D VBAP and compute their inverse matrices.
 ///
-/// Based on Ardour's `choose_speaker_triplets()` in vbap_speakers.cc.
-/// This implements a convex hull-like algorithm to find valid triangular facets.
+/// The active triangles are the faces of the convex hull of the speaker
+/// direction vectors, minus any face whose supporting plane passes through the
+/// listener. Radially projected from the listener, hull faces tile the sphere
+/// exactly once, which is precisely the non-intersecting arrangement Pulkki
+/// (1997) §2.3 requires: "The active triangles of bases should not be
+/// intersecting."
+///
+/// Faces lying in a plane through the origin are dropped because their basis
+/// matrix is singular by construction — this is the flat "bottom" spanned by a
+/// horizontal speaker ring, which every surround layout has.
 fn choose_speaker_triplets(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
     let n = speakers.len();
     if n < 3 {
@@ -330,140 +349,51 @@ fn choose_speaker_triplets(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
         });
     }
 
-    // Connection matrix: connections[i*n + j] = true if speakers i and j are connected
-    let mut connections = vec![true; n * n];
+    let points: Vec<DVec3> = speakers.iter().map(|s| s.cartesian()).collect();
 
-    // First pass: find all potentially valid triplets
-    let mut candidates: Vec<(usize, usize, usize, f64)> = Vec::new();
+    // A hull needs four non-coplanar points; with exactly three speakers the
+    // single triangle they span is the only possible base.
+    let faces: Vec<[usize; 3]> = if n == 3 {
+        vec![[0, 1, 2]]
+    } else {
+        convex_hull(&points, HULL_EPSILON)
+    };
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            for k in (j + 1)..n {
-                let v1 = speakers[i].cartesian();
-                let v2 = speakers[j].cartesian();
-                let v3 = speakers[k].cartesian();
+    let tuples = faces
+        .into_iter()
+        .filter_map(|[i, j, k]| {
+            let (v1, v2, v3) = (points[i], points[j], points[k]);
 
-                // Calculate volume-to-perimeter ratio (filters degenerate triplets)
-                let cross = v1.cross(v2);
-                let vol = cross.dot(v3).abs();
-                let side_sum = v1.angle_between(v2) + v1.angle_between(v3) + v2.angle_between(v3);
-
-                if side_sum < 1e-10 {
-                    continue;
-                }
-
-                let vol_p_side = vol / side_sum;
-
-                if vol_p_side > MIN_VOL_P_SIDE_LGTH {
-                    candidates.push((i, j, k, vol_p_side));
-                }
+            // Drop faces whose supporting plane contains the listener. These are
+            // the degenerate great-circle faces produced by a coplanar speaker
+            // ring; their radial projection would overlap the real faces.
+            let normal = (v2 - v1).cross(v3 - v1);
+            if normal.length_squared() < NORMAL_EPSILON_SQ {
+                return None;
             }
-        }
-    }
+            if normal.normalize().dot(v1).abs() <= ORIGIN_PLANE_EPSILON {
+                return None;
+            }
 
-    // Build distance table for all speaker pairs, sorted by distance (shortest first)
-    let mut distances: Vec<(usize, usize, f64)> = (0..n)
-        .flat_map(|i| {
-            ((i + 1)..n).map(move |j| {
-                let dist = speakers[i]
-                    .cartesian()
-                    .angle_between(speakers[j].cartesian());
-                (i, j, dist)
+            let mat = DMat3::from_cols(v1, v2, v3);
+            if mat.determinant().abs() < DET_EPSILON {
+                return None;
+            }
+
+            Some(SpeakerTuple {
+                speaker_indices: vec![i, j, k],
+                inverse_matrix: InverseMatrix::ThreeD(mat.inverse()),
             })
         })
         .collect();
-    distances.sort_by(|a, b| a.2.total_cmp(&b.2));
-
-    // Remove crossing connections (longer lines that cross shorter ones)
-    for (a, b, _) in &distances {
-        let va = speakers[*a].cartesian();
-        let vb = speakers[*b].cartesian();
-
-        // Check all other connections
-        for (c, d, _) in &distances {
-            if a == c || a == d || b == c || b == d {
-                continue;
-            }
-
-            if !connections[*c * n + *d] {
-                continue;
-            }
-
-            let vc = speakers[*c].cartesian();
-            let vd = speakers[*d].cartesian();
-
-            if lines_intersect(va, vb, vc, vd) {
-                // Remove the longer connection
-                let dist_ab = va.angle_between(vb);
-                let dist_cd = vc.angle_between(vd);
-
-                if dist_cd > dist_ab {
-                    connections[*c * n + *d] = false;
-                    connections[*d * n + *c] = false;
-                }
-            }
-        }
-    }
-
-    // Filter triplets based on remaining connections
-    let mut tuples = Vec::new();
-
-    for (i, j, k, _) in candidates {
-        // Check if all three sides are still connected
-        if !connections[i * n + j] || !connections[i * n + k] || !connections[j * n + k] {
-            continue;
-        }
-
-        // Check if any other speaker is "inside" this triplet
-        let v1 = speakers[i].cartesian();
-        let v2 = speakers[j].cartesian();
-        let v3 = speakers[k].cartesian();
-
-        let has_interior_speaker = speakers.iter().enumerate().any(|(m, speaker)| {
-            m != i && m != j && m != k && is_inside_triangle(speaker.cartesian(), v1, v2, v3)
-        });
-
-        if has_interior_speaker {
-            continue;
-        }
-
-        // Compute 3x3 inverse matrix using glam
-        // Matrix columns are the speaker direction vectors
-        let mat = DMat3::from_cols(v1, v2, v3);
-
-        if mat.determinant().abs() < 1e-10 {
-            continue;
-        }
-
-        tuples.push(SpeakerTuple {
-            speaker_indices: vec![i, j, k],
-            inverse_matrix: InverseMatrix::ThreeD(mat.inverse()),
-        });
-    }
 
     Ok(tuples)
-}
-
-/// Check if point p is inside the spherical triangle defined by v1, v2, v3.
-fn is_inside_triangle(p: DVec3, v1: DVec3, v2: DVec3, v3: DVec3) -> bool {
-    // Use barycentric-like approach on the sphere
-    // Point is inside if it's on the same side of all three edges
-
-    let n1 = v1.cross(v2);
-    let n2 = v2.cross(v3);
-    let n3 = v3.cross(v1);
-
-    let d1 = p.dot(n1);
-    let d2 = p.dot(n2);
-    let d3 = p.dot(n3);
-
-    // All same sign means inside (or on edge)
-    (d1 >= 0.0 && d2 >= 0.0 && d3 >= 0.0) || (d1 <= 0.0 && d2 <= 0.0 && d3 <= 0.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::spherical_to_cartesian;
 
     #[test]
     fn test_build_stereo() {
@@ -517,6 +447,102 @@ mod tests {
             result,
             Err(VBAPError::InsufficientSpeakers { provided: 1, .. })
         ));
+    }
+
+    /// Every 3D preset, as (name, positions).
+    fn three_d_presets() -> [(&'static str, &'static [(f64, f64)]); 4] {
+        [
+            ("atmos_7_1_4", presets::ATMOS_7_1_4),
+            ("atmos_5_1_4", presets::ATMOS_5_1_4),
+            ("atmos_9_1_6", presets::ATMOS_9_1_6),
+            ("auro_9_1", presets::AURO_9_1),
+        ]
+    }
+
+    #[test]
+    fn test_no_orphan_speakers_3d() {
+        // Every speaker must belong to at least one triplet, or it can never
+        // produce sound. The centre channel used to be orphaned in every Atmos
+        // layout, which made dialogue silent.
+        for (name, positions) in three_d_presets() {
+            let config = SpeakerConfigBuilder::new()
+                .add_speakers(positions)
+                .build_config()
+                .unwrap();
+
+            for idx in 0..config.num_speakers() {
+                let used = config
+                    .tuples()
+                    .iter()
+                    .any(|t| t.speaker_indices.contains(&idx));
+                assert!(used, "{name}: speaker {idx} appears in no triplet");
+            }
+        }
+    }
+
+    #[test]
+    fn test_triplets_do_not_overlap() {
+        // Pulkki §2.3: active triangles must not intersect. Overlapping regions
+        // make the max-min selection tie on interior points, so the winner flips
+        // on float noise as a source moves — an audible click.
+        for (name, positions) in three_d_presets() {
+            let config = SpeakerConfigBuilder::new()
+                .add_speakers(positions)
+                .build_config()
+                .unwrap();
+
+            let mut elevation = -80.0;
+            while elevation <= 80.0 {
+                let mut azimuth = -180.0;
+                while azimuth < 180.0 {
+                    let dir = spherical_to_cartesian(azimuth, elevation);
+                    let interior = config
+                        .tuples()
+                        .iter()
+                        .filter(|t| match &t.inverse_matrix {
+                            InverseMatrix::ThreeD(inv) => {
+                                let g = *inv * dir;
+                                g.x > 1e-7 && g.y > 1e-7 && g.z > 1e-7
+                            }
+                            InverseMatrix::TwoD(_) => false,
+                        })
+                        .count();
+                    assert!(
+                        interior <= 1,
+                        "{name}: direction ({azimuth}, {elevation}) is interior to \
+                         {interior} triplets"
+                    );
+                    azimuth += 5.0;
+                }
+                elevation += 5.0;
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_coplanar_force3d_errors() {
+        // A horizontal-only ring cannot span 3D. This must be a clean error
+        // rather than a panic or a silently empty configuration.
+        let result = SpeakerConfigBuilder::new()
+            .surround_5_1()
+            .dimension(Dimension::Force3D)
+            .build_config();
+
+        assert!(matches!(result, Err(VBAPError::InvalidConfiguration(_))));
+    }
+
+    #[test]
+    fn test_minimal_3d_triplet() {
+        // Three non-coplanar speakers form exactly one base.
+        let config = SpeakerConfigBuilder::new()
+            .add_speaker(0.0, 0.0)
+            .add_speaker(120.0, 0.0)
+            .add_speaker(0.0, 90.0)
+            .build_config()
+            .unwrap();
+
+        assert_eq!(config.mode(), PanningMode::ThreeD);
+        assert_eq!(config.tuples().len(), 1);
     }
 
     #[test]
