@@ -137,6 +137,16 @@ impl VBAPanner {
         // Apply the winning gains
         let best_tuple = &tuples[best_tuple_idx];
 
+        // Clamp negative factors to zero *before* normalizing. Pulkki (1997)
+        // §1.4: "The negative factor must be set to zero before normalization."
+        // Inside the active region every factor is already non-negative, so this
+        // is a no-op there. Outside it, clamping first keeps the surviving gains
+        // at full level instead of spending part of the power budget on a
+        // negative factor that is then discarded.
+        for gain in best_gains[..best_len].iter_mut() {
+            *gain = gain.max(0.0);
+        }
+
         // Normalize gains: sqrt(sum of squares) = 1
         let sum_sq: f64 = best_gains[..best_len].iter().map(|g| g * g).sum();
         let norm = if sum_sq > 1e-10 {
@@ -150,7 +160,7 @@ impl VBAPanner {
             .iter()
             .zip(&best_gains[..best_len])
         {
-            gains[speaker_idx] = (gain * norm).max(0.0);
+            gains[speaker_idx] = gain * norm;
         }
     }
 
