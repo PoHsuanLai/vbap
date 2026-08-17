@@ -79,6 +79,33 @@
 //! [EBU ADM Guidelines](https://adm.ebu.io/reference/excursions/coordinate_system.html):
 //! 0° straight ahead, positive azimuth to the left.
 //!
+//! ## Real-time use
+//!
+//! On an audio thread, prefer [`VBAPanner::compute_active_gains`]. It returns
+//! only the two or three speakers that actually receive signal, so it does no
+//! work proportional to the speaker count, and it accumulates into a mix buffer
+//! that you clear once per block rather than once per source.
+//!
+//! ```rust
+//! use vbap::{PanCursor, VBAPanner};
+//!
+//! let panner = VBAPanner::builder().atmos_7_1_4().build().unwrap();
+//!
+//! // One cursor per source; it remembers the last speaker base so a moving
+//! // source usually skips the search entirely.
+//! let mut cursor = PanCursor::default();
+//! let mut mix = vec![0.0; panner.num_speakers()];
+//!
+//! for (azimuth, elevation) in [(0.0, 0.0), (45.0, 30.0)] {
+//!     let active = panner.compute_active_gains(azimuth, elevation, &mut cursor);
+//!     active.accumulate_into(&mut mix);
+//! }
+//! ```
+//!
+//! Both this and [`VBAPanner::compute_gains_into`] allocate nothing, take no
+//! locks, and cannot panic in release builds. `VBAPanner` is `Send + Sync`, so
+//! one panner can serve many voices concurrently.
+//!
 //! ## Coverage
 //!
 //! VBAP can only place a source inside the region the speakers span (Pulkki
@@ -104,8 +131,8 @@ pub mod speaker;
 
 // Re-exports for ergonomic API
 pub use config::{
-    Dimension, InverseMatrix, PanningMode, SpeakerConfig, SpeakerConfigBuilder, SpeakerTuple,
+    Dimension, PanningMode, SpeakerConfig, SpeakerConfigBuilder, SpeakerPair, SpeakerTriplet,
 };
 pub use error::{PanError, Result, VBAPError};
-pub use panner::VBAPanner;
+pub use panner::{ActiveGains, PanCursor, VBAPanner};
 pub use speaker::Speaker;

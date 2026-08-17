@@ -69,22 +69,53 @@ pub enum Dimension {
     Force3D,
 }
 
-/// Precomputed inverse matrix for gain computation.
+/// A speaker pair with its precomputed inverse basis (2D panning).
 #[derive(Clone, Copy, Debug)]
-pub enum InverseMatrix {
-    /// 2x2 matrix for 2D panning (speaker pairs).
-    TwoD(DMat2),
-    /// 3x3 matrix for 3D panning (speaker triplets).
-    ThreeD(DMat3),
+pub struct SpeakerPair {
+    /// Indices of the two speakers spanning this base.
+    pub speakers: [u32; 2],
+    /// Inverse of the 2x2 basis matrix.
+    pub inverse: DMat2,
 }
 
-/// A speaker tuple (pair or triplet) with its precomputed inverse matrix.
+/// A speaker triplet with its precomputed inverse basis (3D panning).
+#[derive(Clone, Copy, Debug)]
+pub struct SpeakerTriplet {
+    /// Indices of the three speakers spanning this base.
+    pub speakers: [u32; 3],
+    /// Inverse of the 3x3 basis matrix.
+    pub inverse: DMat3,
+}
+
+/// Precomputed bases, specialized by panning mode.
+///
+/// Keeping the two cases in separate vectors rather than a per-tuple enum means
+/// the mode is resolved once per call instead of once per candidate base, and
+/// lets the compiler vectorize the search loop. It also keeps the 2D case from
+/// paying for 3D-sized storage.
 #[derive(Clone, Debug)]
-pub struct SpeakerTuple {
-    /// Indices of speakers in this tuple (2 for 2D, 3 for 3D).
-    pub speaker_indices: Vec<usize>,
-    /// Inverse matrix for gain computation.
-    pub inverse_matrix: InverseMatrix,
+pub(crate) enum Bases {
+    /// Pairs for 2D panning.
+    Two(Vec<SpeakerPair>),
+    /// Triplets for 3D panning.
+    Three(Vec<SpeakerTriplet>),
+}
+
+impl Bases {
+    /// Number of bases available.
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Bases::Two(v) => v.len(),
+            Bases::Three(v) => v.len(),
+        }
+    }
+
+    /// Whether any base was formed.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A fully configured speaker setup ready for VBAP computation.
@@ -94,8 +125,8 @@ pub struct SpeakerConfig {
     speakers: Vec<Speaker>,
     /// Resolved panning mode.
     mode: PanningMode,
-    /// Precomputed speaker tuples with inverse matrices.
-    tuples: Vec<SpeakerTuple>,
+    /// Precomputed bases with their inverse matrices.
+    pub(crate) bases: Bases,
 }
 
 impl SpeakerConfig {
@@ -117,10 +148,32 @@ impl SpeakerConfig {
         self.mode
     }
 
-    /// Get the speaker tuples (pairs for 2D, triplets for 3D).
+    /// Get the speaker pairs used for 2D panning.
+    ///
+    /// Returns an empty slice when the configuration is 3D.
     #[inline]
-    pub fn tuples(&self) -> &[SpeakerTuple] {
-        &self.tuples
+    pub fn pairs(&self) -> &[SpeakerPair] {
+        match &self.bases {
+            Bases::Two(v) => v,
+            Bases::Three(_) => &[],
+        }
+    }
+
+    /// Get the speaker triplets used for 3D panning.
+    ///
+    /// Returns an empty slice when the configuration is 2D.
+    #[inline]
+    pub fn triplets(&self) -> &[SpeakerTriplet] {
+        match &self.bases {
+            Bases::Three(v) => v,
+            Bases::Two(_) => &[],
+        }
+    }
+
+    /// Number of bases (pairs or triplets) in this configuration.
+    #[inline]
+    pub fn num_bases(&self) -> usize {
+        self.bases.len()
     }
 }
 
@@ -256,13 +309,13 @@ impl SpeakerConfigBuilder {
             .map(|(id, (azi, ele))| Speaker::new(id, azi, ele))
             .collect();
 
-        // Compute tuples based on mode
-        let tuples = match mode {
-            PanningMode::ThreeD => choose_speaker_triplets(&speakers)?,
-            PanningMode::TwoD => choose_speaker_pairs(&speakers)?,
+        // Compute bases based on mode
+        let bases = match mode {
+            PanningMode::ThreeD => Bases::Three(choose_speaker_triplets(&speakers)?),
+            PanningMode::TwoD => Bases::Two(choose_speaker_pairs(&speakers)?),
         };
 
-        if tuples.is_empty() {
+        if bases.is_empty() {
             let reason = if mode == PanningMode::ThreeD {
                 "3D panning requires speakers that are not all coplanar with the \
                  listener; use Dimension::Force2D or add an elevated speaker"
@@ -276,7 +329,7 @@ impl SpeakerConfigBuilder {
         Ok(SpeakerConfig {
             speakers,
             mode,
-            tuples,
+            bases,
         })
     }
 }
@@ -291,7 +344,7 @@ impl SpeakerConfigBuilder {
 /// valid pair, so layouts that surround the listener cover every direction while
 /// open ones (stereo, LCR, frontal arrays) stay silent behind the listener
 /// rather than rendering a phantom across a gap they cannot cover.
-fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
+fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerPair>> {
     let n = speakers.len();
     if n < 2 {
         return Err(VBAPError::InsufficientSpeakers {
@@ -356,13 +409,13 @@ fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
 
             let mat = DMat2::from_cols(DVec2::new(sin1, cos1), DVec2::new(sin2, cos2));
 
-            if mat.determinant().abs() < 1e-10 {
+            if mat.determinant().abs() < DET_EPSILON {
                 return None;
             }
 
-            Some(SpeakerTuple {
-                speaker_indices: vec![idx1, idx2],
-                inverse_matrix: InverseMatrix::TwoD(mat.inverse()),
+            Some(SpeakerPair {
+                speakers: [idx1 as u32, idx2 as u32],
+                inverse: mat.inverse(),
             })
         })
         .collect();
@@ -382,7 +435,7 @@ fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
 /// Faces lying in a plane through the origin are dropped because their basis
 /// matrix is singular by construction — this is the flat "bottom" spanned by a
 /// horizontal speaker ring, which every surround layout has.
-fn choose_speaker_triplets(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
+fn choose_speaker_triplets(speakers: &[Speaker]) -> Result<Vec<SpeakerTriplet>> {
     let n = speakers.len();
     if n < 3 {
         return Err(VBAPError::InsufficientSpeakers {
@@ -422,9 +475,9 @@ fn choose_speaker_triplets(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
                 return None;
             }
 
-            Some(SpeakerTuple {
-                speaker_indices: vec![i, j, k],
-                inverse_matrix: InverseMatrix::ThreeD(mat.inverse()),
+            Some(SpeakerTriplet {
+                speakers: [i as u32, j as u32, k as u32],
+                inverse: mat.inverse(),
             })
         })
         .collect();
@@ -443,7 +496,7 @@ mod tests {
 
         assert_eq!(config.num_speakers(), 2);
         assert_eq!(config.mode(), PanningMode::TwoD);
-        assert!(!config.tuples().is_empty());
+        assert!(config.num_bases() > 0);
     }
 
     #[test]
@@ -514,9 +567,9 @@ mod tests {
 
             for idx in 0..config.num_speakers() {
                 let used = config
-                    .tuples()
+                    .triplets()
                     .iter()
-                    .any(|t| t.speaker_indices.contains(&idx));
+                    .any(|t| t.speakers.contains(&(idx as u32)));
                 assert!(used, "{name}: speaker {idx} appears in no triplet");
             }
         }
@@ -539,14 +592,11 @@ mod tests {
                 while azimuth < 180.0 {
                     let dir = spherical_to_cartesian(azimuth, elevation);
                     let interior = config
-                        .tuples()
+                        .triplets()
                         .iter()
-                        .filter(|t| match &t.inverse_matrix {
-                            InverseMatrix::ThreeD(inv) => {
-                                let g = *inv * dir;
-                                g.x > 1e-7 && g.y > 1e-7 && g.z > 1e-7
-                            }
-                            InverseMatrix::TwoD(_) => false,
+                        .filter(|t| {
+                            let g = t.inverse * dir;
+                            g.x > 1e-7 && g.y > 1e-7 && g.z > 1e-7
                         })
                         .count();
                     assert!(
@@ -584,7 +634,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.mode(), PanningMode::ThreeD);
-        assert_eq!(config.tuples().len(), 1);
+        assert_eq!(config.num_bases(), 1);
     }
 
     #[test]

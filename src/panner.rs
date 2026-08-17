@@ -6,7 +6,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::config::{InverseMatrix, PanningMode, SpeakerConfig, SpeakerConfigBuilder};
+use crate::config::{Bases, PanningMode, SpeakerConfig, SpeakerConfigBuilder};
 use crate::error::PanError;
 use crate::math::spherical_to_cartesian;
 use crate::speaker::Speaker;
@@ -21,6 +21,165 @@ use glam::DVec2;
 /// genuinely outside the arc, which only happens on layouts that do not
 /// surround the listener.
 const OUT_OF_ARC_TOLERANCE: f64 = 1e-6;
+
+/// Remembers which base was last selected, so a moving source can skip the
+/// search when it has not left that base.
+///
+/// Held by the caller rather than the panner: it keeps [`VBAPanner`] shareable
+/// across threads (`&VBAPanner` stays `Sync`), and gives each source its own
+/// coherence instead of one shared slot thrashing between sources that are
+/// moving in different directions.
+///
+/// A default or stale cursor is always safe — it only costs a full search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PanCursor(u32);
+
+/// The speakers that receive signal for one source direction, and their gains.
+///
+/// At most three entries are populated (two in 2D). Empty means the direction
+/// lies outside the region the speakers span, so nothing should be played.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ActiveGains {
+    gains: [(u32, f64); 3],
+    len: u8,
+}
+
+impl ActiveGains {
+    /// Build from a base's speaker indices and its normalized gain factors.
+    #[inline]
+    fn new(speakers: &[u32], factors: &[f64]) -> Self {
+        let mut out = ActiveGains::default();
+        for (&speaker, &gain) in speakers.iter().zip(factors) {
+            out.gains[out.len as usize] = (speaker, gain);
+            out.len += 1;
+        }
+        out
+    }
+
+    /// Iterate over the `(speaker_index, gain)` pairs that are active.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (u32, f64)> + '_ {
+        self.gains[..self.len as usize].iter().copied()
+    }
+
+    /// Number of active speakers (0, 2, or 3).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Whether the direction lies outside the region the speakers span.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Add these gains into an output slice, leaving other entries alone.
+    ///
+    /// This is the operation a mixer wants: several sources accumulate into one
+    /// buffer, so the buffer is cleared once per block rather than once per
+    /// source.
+    ///
+    /// # Panics
+    /// Panics only in debug builds if a speaker index is out of range.
+    #[inline]
+    pub fn accumulate_into(&self, out: &mut [f64]) {
+        for (speaker, gain) in self.iter() {
+            debug_assert!((speaker as usize) < out.len());
+            if let Some(slot) = out.get_mut(speaker as usize) {
+                *slot += gain;
+            }
+        }
+    }
+}
+
+/// Pick the base whose smallest gain factor is largest, and normalize it.
+///
+/// Returns the winning index and its normalized factors, or `None` when the
+/// direction falls outside every base.
+///
+/// Two shortcuts keep this off the critical path. The cursor's base is tried
+/// first, and a base whose factors are all non-negative wins immediately: active
+/// regions do not overlap, so no other base can contain the direction. Both are
+/// exact — they select the same base a full scan would.
+#[inline]
+fn select_base<B, F>(
+    bases: &[B],
+    cursor: &mut PanCursor,
+    mut factors_of: F,
+) -> (Option<usize>, [f64; 3])
+where
+    F: FnMut(&B) -> [f64; 3],
+{
+    if bases.is_empty() {
+        return (None, [0.0; 3]);
+    }
+
+    let mut best_idx = 0usize;
+    let mut best_min = f64::NEG_INFINITY;
+    let mut best_factors = [0.0f64; 3];
+    let mut found = false;
+
+    // Try the previously selected base first.
+    let start = (cursor.0 as usize).min(bases.len() - 1);
+    let order = core::iter::once(start).chain((0..bases.len()).filter(|&i| i != start));
+
+    for idx in order {
+        let factors = factors_of(&bases[idx]);
+        let min = factors[0].min(factors[1]).min(factors[2]);
+
+        if min > best_min {
+            best_min = min;
+            best_idx = idx;
+            best_factors = factors;
+            found = true;
+        }
+
+        // All factors non-negative: this base contains the direction, and
+        // regions do not overlap, so no later base can beat it.
+        if min >= 0.0 {
+            break;
+        }
+    }
+
+    // A clearly negative factor means the direction lies outside every active
+    // region. Pulkki (1997) §3: "the virtual source can not be positioned
+    // outside the active arc or region." Returning nothing keeps the output
+    // silent instead of renormalizing a surviving component up to full level
+    // and rendering a phantom the layout cannot produce.
+    if !found || best_min < -OUT_OF_ARC_TOLERANCE {
+        return (None, [0.0; 3]);
+    }
+
+    cursor.0 = best_idx as u32;
+
+    // Clamp the remaining slightly-negative factors *before* normalizing, per
+    // Pulkki §1.4: "The negative factor must be set to zero before
+    // normalization." These are numerical noise at an arc boundary.
+    //
+    // The 2D path pads its unused third slot with +inf so it cannot become the
+    // minimum above; drop it here so it never reaches the sum of squares.
+    for factor in best_factors.iter_mut() {
+        *factor = if factor.is_finite() {
+            factor.max(0.0)
+        } else {
+            0.0
+        };
+    }
+
+    // Normalize so that the sum of squared gains is 1 (Eq. 10/19 with C = 1).
+    let sum_sq = best_factors.iter().map(|g| g * g).sum::<f64>();
+    let norm = if sum_sq > 1e-10 {
+        1.0 / libm::sqrt(sum_sq)
+    } else {
+        0.0
+    };
+    for factor in best_factors.iter_mut() {
+        *factor *= norm;
+    }
+
+    (Some(best_idx), best_factors)
+}
 
 /// Vector Base Amplitude Panner.
 ///
@@ -163,95 +322,78 @@ impl VBAPanner {
         Ok(())
     }
 
+    /// Compute only the speakers that actually receive signal.
+    ///
+    /// This is the cheapest way to drive a large layout: it does no work
+    /// proportional to the speaker count, where
+    /// [`compute_gains_into`](Self::compute_gains_into) must zero the whole
+    /// output slice on every call even though at most three entries change.
+    ///
+    /// `cursor` carries the previously selected base. A moving source usually
+    /// stays within the same base from one block to the next, so re-testing it
+    /// first turns the search into a single hit in the common case. Give each
+    /// concurrent source its own cursor; a stale or default cursor only costs
+    /// speed, never correctness.
+    ///
+    /// ```
+    /// use vbap::{PanCursor, VBAPanner};
+    ///
+    /// let panner = VBAPanner::builder().surround_5_1().build().unwrap();
+    /// let mut cursor = PanCursor::default();
+    /// let mut mix = vec![0.0; panner.num_speakers()];
+    ///
+    /// let active = panner.compute_active_gains(45.0, 0.0, &mut cursor);
+    /// active.accumulate_into(&mut mix);
+    /// ```
+    #[inline]
+    pub fn compute_active_gains(
+        &self,
+        azimuth: f64,
+        elevation: f64,
+        cursor: &mut PanCursor,
+    ) -> ActiveGains {
+        debug_assert!(
+            azimuth.is_finite() && elevation.is_finite(),
+            "non-finite direction: azimuth={}, elevation={}",
+            azimuth,
+            elevation
+        );
+
+        let direction = spherical_to_cartesian(azimuth, elevation);
+
+        match &self.config.bases {
+            Bases::Two(pairs) => {
+                let dir = DVec2::new(direction.x, direction.y);
+                // The unused third slot is +inf so it never becomes the minimum.
+                let (best, factors) = select_base(pairs, cursor, |pair| {
+                    let g = pair.inverse * dir;
+                    [g.x, g.y, f64::INFINITY]
+                });
+                match best {
+                    Some(i) => ActiveGains::new(&pairs[i].speakers, &factors[..2]),
+                    None => ActiveGains::default(),
+                }
+            }
+            Bases::Three(triplets) => {
+                let (best, factors) = select_base(triplets, cursor, |triplet| {
+                    let g = triplet.inverse * direction;
+                    [g.x, g.y, g.z]
+                });
+                match best {
+                    Some(i) => ActiveGains::new(&triplets[i].speakers, &factors),
+                    None => ActiveGains::default(),
+                }
+            }
+        }
+    }
+
     /// Shared implementation. Caller guarantees `gains.len() >= num_speakers()`.
     #[inline]
     fn compute_gains_unchecked(&self, azimuth: f64, elevation: f64, gains: &mut [f64]) {
-        // Zero out all gains
         gains.fill(0.0);
-
-        let tuples = self.config.tuples();
-        if tuples.is_empty() {
-            return;
-        }
-
-        // Convert source direction to Cartesian
-        let direction = spherical_to_cartesian(azimuth, elevation);
-
-        // Find the best tuple (highest minimum gain)
-        let mut best_tuple_idx = 0;
-        let mut best_min_gain = f64::NEG_INFINITY;
-        let mut best_gains = [0.0f64; 3];
-        let mut best_len = 0usize;
-
-        for (tuple_idx, tuple) in tuples.iter().enumerate() {
-            // Compute candidate gains by multiplying direction with inverse matrix
-            let (candidate_gains, len) = match tuple.inverse_matrix {
-                InverseMatrix::ThreeD(mat) => {
-                    let result = mat * direction;
-                    ([result.x, result.y, result.z], 3)
-                }
-                InverseMatrix::TwoD(mat) => {
-                    let dir_2d = DVec2::new(direction.x, direction.y);
-                    let result = mat * dir_2d;
-                    ([result.x, result.y, 0.0], 2)
-                }
-            };
-
-            // Find minimum gain - we want the tuple where all gains are positive
-            let min_gain = candidate_gains[..len]
-                .iter()
-                .copied()
-                .reduce(f64::min)
-                .unwrap_or(f64::NEG_INFINITY);
-
-            if min_gain > best_min_gain {
-                best_min_gain = min_gain;
-                best_tuple_idx = tuple_idx;
-                best_gains = candidate_gains;
-                best_len = len;
-            }
-        }
-
-        // A clearly negative factor means the direction lies outside every
-        // active region: no combination of these speakers points there. Pulkki
-        // (1997) §3: "the virtual source can not be positioned outside the
-        // active arc or region." Leave the gains at zero rather than clamping
-        // and renormalizing, which would rescale the surviving component back to
-        // full level and produce a phantom the layout cannot actually render.
-        //
-        // Only closed layouts cover every direction; open ones (stereo, LCR, a
-        // frontal array) fall outside behind the listener.
-        if best_min_gain < -OUT_OF_ARC_TOLERANCE {
-            return;
-        }
-
-        // Apply the winning gains
-        let best_tuple = &tuples[best_tuple_idx];
-
-        // Clamp the remaining slightly-negative factors to zero *before*
-        // normalizing. Pulkki (1997) §1.4: "The negative factor must be set to
-        // zero before normalization." These are numerical noise at an arc
-        // boundary, so this is a no-op everywhere except within a hair of an
-        // edge, where it keeps the surviving gains at full level.
-        for gain in best_gains[..best_len].iter_mut() {
-            *gain = gain.max(0.0);
-        }
-
-        // Normalize gains: sqrt(sum of squares) = 1
-        let sum_sq: f64 = best_gains[..best_len].iter().map(|g| g * g).sum();
-        let norm = if sum_sq > 1e-10 {
-            1.0 / libm::sqrt(sum_sq)
-        } else {
-            0.0
-        };
-
-        for (&speaker_idx, &gain) in best_tuple
-            .speaker_indices
-            .iter()
-            .zip(&best_gains[..best_len])
-        {
-            gains[speaker_idx] = gain * norm;
-        }
+        let mut cursor = PanCursor::default();
+        self.compute_active_gains(azimuth, elevation, &mut cursor)
+            .accumulate_into(gains);
     }
 
     /// Get the number of speakers in this configuration.
@@ -445,9 +587,12 @@ mod tests {
         }
     }
 
+    // Non-finite input trips a `debug_assert!` by design — it means the caller
+    // has a bug. This test pins the *release* contract instead: silence rather
+    // than NaN reaching the audio buffer.
     #[test]
+    #[cfg(not(debug_assertions))]
     fn test_non_finite_input_yields_silence() {
-        // Guaranteed behaviour: never leak NaN into the audio buffer.
         let panner = VBAPanner::builder().surround_5_1().build().unwrap();
         let mut gains = vec![0.0; 5];
 
@@ -550,7 +695,7 @@ mod tests {
     fn test_stereo_forms_single_pair() {
         // Two speakers describe one arc; the modular wrap used to emit it twice.
         let panner = VBAPanner::builder().stereo().build().unwrap();
-        assert_eq!(panner.config().tuples().len(), 1);
+        assert_eq!(panner.config().num_bases(), 1);
     }
 
     #[test]
@@ -594,6 +739,86 @@ mod tests {
             core::mem::swap(&mut prev, &mut cur);
             azimuth += 0.25;
         }
+    }
+
+    #[test]
+    fn test_active_gains_match_dense_output() {
+        // The sparse and dense paths must agree exactly, including which
+        // directions produce nothing at all.
+        for panner in [
+            VBAPanner::builder().stereo().build().unwrap(),
+            VBAPanner::builder().lcr().build().unwrap(),
+            VBAPanner::builder().surround_7_1().build().unwrap(),
+            VBAPanner::builder().atmos_7_1_4().build().unwrap(),
+        ] {
+            let n = panner.num_speakers();
+            let mut dense = vec![0.0; n];
+            let mut sparse = vec![0.0; n];
+            let mut cursor = PanCursor::default();
+
+            for step in 0..720 {
+                let azimuth = -180.0 + step as f64 * 0.5;
+                for elevation in [-30.0, 0.0, 30.0, 60.0] {
+                    panner.compute_gains_into(azimuth, elevation, &mut dense);
+
+                    sparse.fill(0.0);
+                    let active = panner.compute_active_gains(azimuth, elevation, &mut cursor);
+                    active.accumulate_into(&mut sparse);
+
+                    assert_eq!(
+                        dense, sparse,
+                        "mismatch at azimuth {azimuth}, elevation {elevation}"
+                    );
+                    assert!(active.len() <= 3);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cursor_does_not_change_results() {
+        // A stale cursor may only cost time, never correctness.
+        let panner = VBAPanner::builder().atmos_7_1_4().build().unwrap();
+        let mut fresh = PanCursor::default();
+        let mut reused = PanCursor::default();
+
+        // Drive `reused` somewhere unrelated first.
+        panner.compute_active_gains(150.0, 40.0, &mut reused);
+
+        for step in 0..360 {
+            let azimuth = -180.0 + step as f64;
+            let a = panner.compute_active_gains(azimuth, 20.0, &mut PanCursor::default());
+            let b = panner.compute_active_gains(azimuth, 20.0, &mut fresh);
+            let c = panner.compute_active_gains(azimuth, 20.0, &mut reused);
+            assert_eq!(a, b);
+            assert_eq!(a, c);
+        }
+    }
+
+    #[test]
+    fn test_accumulate_into_sums_sources() {
+        // Several sources mix into one buffer without clearing between them.
+        let panner = VBAPanner::builder().surround_5_1().build().unwrap();
+        let mut cursor = PanCursor::default();
+        let mut mix = vec![0.0; panner.num_speakers()];
+
+        let a = panner.compute_active_gains(30.0, 0.0, &mut cursor);
+        let b = panner.compute_active_gains(-30.0, 0.0, &mut cursor);
+        a.accumulate_into(&mut mix);
+        b.accumulate_into(&mut mix);
+
+        // Both sources sit exactly on a speaker, so each contributes 1.0.
+        assert_relative_eq!(mix[0], 1.0, epsilon = 1e-9);
+        assert_relative_eq!(mix[1], 1.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_panner_is_send_and_sync() {
+        // Sharing one panner across voices/threads must keep working.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VBAPanner>();
+        assert_send_sync::<PanCursor>();
+        assert_send_sync::<ActiveGains>();
     }
 
     #[test]

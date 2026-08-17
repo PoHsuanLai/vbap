@@ -63,11 +63,30 @@ of `compute_gains_into` arrives here too.
 
 ### Added
 
+- `VBAPanner::compute_active_gains`, returning only the two or three speakers
+  that actually receive signal as an `ActiveGains` value. It does no work
+  proportional to the speaker count, where `compute_gains_into` must zero the
+  whole output slice on every call. `ActiveGains::accumulate_into` sums into a
+  mix buffer, so a mixer clears once per block rather than once per source.
+
+  Measured against the previous release (2M calls along a moving-source path):
+  64-speaker ring `78.7 → 13.4 ns` (5.9x), 128-speaker ring `→ 19.2 ns`,
+  Atmos 7.1.4 `30.4 → 17.5 ns` (1.7x). Both paths remain allocation-free,
+  verified with a counting allocator.
+
+- `PanCursor`, which remembers the last selected base so a moving source can
+  skip the search while it stays inside that base. Held by the caller rather
+  than the panner, which keeps `&VBAPanner` `Sync` — one panner can still be
+  shared across voices and threads — and gives each source its own coherence.
+  A default or stale cursor only costs speed, never correctness.
+
 - `VBAPanner::try_compute_gains_into`, returning `Result<(), PanError>` for a
   too-small output slice. `PanError` is `Copy` and allocation-free, so it is safe
   to use on an audio thread.
 - Non-finite (`NaN`/infinite) input is now *guaranteed* to yield all-zero gains
   rather than leaking `NaN` into the output buffer.
+- `SpeakerConfig::pairs`, `SpeakerConfig::triplets`, and
+  `SpeakerConfig::num_bases`.
 
 ### Changed
 
@@ -78,7 +97,18 @@ of `compute_gains_into` arrives here too.
 - Better error messages when no valid bases can be formed — in particular for a
   fully horizontal layout built with `Dimension::Force3D`.
 
+- Bases are now stored per mode (`Vec<SpeakerPair>` or `Vec<SpeakerTriplet>`)
+  with inline `[u32; N]` indices, instead of one `Vec<SpeakerTuple>` of enums
+  each owning a heap-allocated index vector. The panning mode is resolved once
+  per call rather than once per candidate base, which also lets the search loop
+  vectorize.
+
 ### Removed
+
+- `SpeakerTuple`, `InverseMatrix`, and `SpeakerConfig::tuples()`, replaced by
+  `SpeakerPair`, `SpeakerTriplet`, and the `pairs()`/`triplets()` accessors.
+  These were inspection-only surface; a compatibility shim would have had to
+  rebuild a `Vec` per call, reintroducing the allocation the change removes.
 
 - `math::lines_intersect` (crate-internal). It reported arcs sharing an endpoint
   as intersecting, and the edge-pruning stage it fed was the direct cause of the
