@@ -99,6 +99,15 @@ impl VBAPanner {
     /// is not statically known — unwinding out of an audio callback is
     /// undefined behaviour under most host ABIs.
     ///
+    /// # Output
+    ///
+    /// Gains are normalized so that `Σg² = 1` — Pulkki's Eq. (10)/(19) with the
+    /// paper's volume parameter `C` fixed at 1.0. Scale the result by `√C` for a
+    /// different level. Only 2 (2D) or 3 (3D) gains are non-zero.
+    ///
+    /// Directions outside the region the speakers span yield all-zero gains, per
+    /// Pulkki §3; see the crate-level docs on coverage.
+    ///
     /// # Non-finite input
     ///
     /// A NaN or infinite `azimuth`/`elevation` yields all-zero gains rather than

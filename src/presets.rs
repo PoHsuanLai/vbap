@@ -36,7 +36,7 @@ pub const QUAD: &[(f64, f64)] = &[
 
 /// 5.0 surround configuration (no LFE - LFE is not spatialized).
 ///
-/// Based on ITU-R BS.775-1 recommendation.
+/// Based on ITU-R BS.775-3: L/R at ±30°, C at 0°, surrounds at ±110°.
 pub const SURROUND_5_0: &[(f64, f64)] = &[
     (30.0, 0.0),   // L
     (-30.0, 0.0),  // R
@@ -53,7 +53,9 @@ pub const SURROUND_5_1: &[(f64, f64)] = SURROUND_5_0;
 
 /// 7.0 surround configuration.
 ///
-/// Adds side surrounds to the 5.0 layout.
+/// Follows the Dolby/SMPTE cinema layout (side surrounds at ±90°, rear
+/// surrounds at ±150°) rather than the wider surround placement of
+/// ITU-R BS.775-3.
 pub const SURROUND_7_0: &[(f64, f64)] = &[
     (30.0, 0.0),   // L
     (-30.0, 0.0),  // R

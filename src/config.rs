@@ -283,7 +283,14 @@ impl SpeakerConfigBuilder {
 
 /// Choose valid speaker pairs for 2D VBAP and compute their inverse matrices.
 ///
-/// Based on Ardour's `choose_speaker_pairs()` in vbap_speakers.cc.
+/// Bases are formed from adjacent speakers in azimuth order, per Pulkki (1997)
+/// §1.3: "the best way of choose the loudspeaker bases is to let the adjacent
+/// loudspeakers form them", which keeps the active arcs non-overlapping.
+///
+/// The ring is closed only when the remaining gap is narrow enough to be a
+/// valid pair, so layouts that surround the listener cover every direction while
+/// open ones (stereo, LCR, frontal arrays) stay silent behind the listener
+/// rather than rendering a phantom across a gap they cannot cover.
 fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
     let n = speakers.len();
     if n < 2 {

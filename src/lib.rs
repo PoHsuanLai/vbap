@@ -79,11 +79,19 @@
 //! [EBU ADM Guidelines](https://adm.ebu.io/reference/excursions/coordinate_system.html):
 //! 0° straight ahead, positive azimuth to the left.
 //!
+//! ## Coverage
+//!
+//! VBAP can only place a source inside the region the speakers span (Pulkki
+//! §3). Layouts that surround the listener cover every azimuth; a layout with a
+//! wide gap — stereo, LCR, a frontal array, or any dome with nothing below the
+//! horizon — produces silence for directions outside that region rather than a
+//! phantom it cannot render. Inside the covered region the gains always satisfy
+//! `Σg² = 1`.
+//!
 //! ## References
 //!
 //! - Pulkki, V. (1997). ["Virtual Sound Source Positioning Using Vector Base Amplitude Panning."](https://www.aes.org/e-lib/browse.cfm?elib=7853)
 //!   *J. Audio Eng. Soc.*, 45(6), 456–466.
-//! - Implementation adapted from [Ardour](https://ardour.org/) DAW's panner code
 
 extern crate alloc;
 
