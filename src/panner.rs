@@ -3,11 +3,7 @@
 //! This module provides the main `VBAPanner` struct that computes
 //! speaker gains for a given source position.
 
-use alloc::vec;
-use alloc::vec::Vec;
-
 use crate::config::{Bases, PanningMode, SpeakerConfig, SpeakerConfigBuilder};
-use crate::error::PanError;
 use crate::math::spherical_to_cartesian;
 use crate::speaker::Speaker;
 use glam::DVec2;
@@ -189,17 +185,17 @@ where
 /// # Example
 ///
 /// ```
-/// use vbap::VBAPanner;
+/// use vbap::{PanCursor, VBAPanner};
 ///
 /// let panner = VBAPanner::builder()
 ///     .stereo()
 ///     .build()
 ///     .unwrap();
 ///
-/// // Pan a source 15 degrees to the left (alloc-free).
-/// let mut gains = vec![0.0; panner.num_speakers()];
-/// panner.compute_gains_into(15.0, 0.0, &mut gains);
-/// assert_eq!(gains.len(), 2);
+/// // Pan a source 15 degrees to the left.
+/// let mut cursor = PanCursor::default();
+/// let active = panner.compute_gains(15.0, 0.0, &mut cursor);
+/// assert_eq!(active.len(), 2);
 /// ```
 #[derive(Clone, Debug)]
 pub struct VBAPanner {
@@ -219,121 +215,33 @@ impl VBAPanner {
         Self { config }
     }
 
-    /// Compute speaker gains for a source at the given position.
+    /// Compute the gains for a source at the given direction.
     ///
-    /// Allocates a fresh `Vec<f64>` on every call; not suitable for
-    /// real-time audio threads. Prefer [`VBAPanner::compute_gains_into`]
-    /// with a pre-allocated slice on hot paths.
-    ///
-    /// # Arguments
-    /// * `azimuth` - Horizontal angle in degrees (0° = front, 90° = left, -90° = right)
-    /// * `elevation` - Vertical angle in degrees (0° = horizontal, 90° = above)
-    ///
-    /// # Returns
-    /// A vector of gains, one per speaker. Gains are normalized so that
-    /// the sum of squared gains equals 1.0. Most gains will be 0.0,
-    /// with only 2-3 speakers active (depending on 2D/3D mode).
-    #[deprecated(
-        since = "0.1.2",
-        note = "allocates per call; use `compute_gains_into` with a pre-allocated slice"
-    )]
-    pub fn compute_gains(&self, azimuth: f64, elevation: f64) -> Vec<f64> {
-        let mut gains = vec![0.0; self.config.num_speakers()];
-        self.compute_gains_into(azimuth, elevation, &mut gains);
-        gains
-    }
-
-    /// Compute speaker gains into a pre-allocated slice.
-    ///
-    /// This avoids allocation when called repeatedly, and is the intended entry
-    /// point for audio threads: it allocates nothing, takes no locks, and — in
-    /// release builds — cannot panic.
-    ///
-    /// # Real-time contract
-    ///
-    /// `gains.len()` must be at least [`num_speakers()`](Self::num_speakers).
-    /// This is checked by a `debug_assert!`, so an undersized slice panics in
-    /// debug builds and is a no-op in release. Prefer
-    /// [`try_compute_gains_into`](Self::try_compute_gains_into) when the length
-    /// is not statically known — unwinding out of an audio callback is
-    /// undefined behaviour under most host ABIs.
-    ///
-    /// # Output
-    ///
-    /// Gains are normalized so that `Σg² = 1` — Pulkki's Eq. (10)/(19) with the
-    /// paper's volume parameter `C` fixed at 1.0. Scale the result by `√C` for a
-    /// different level. Only 2 (2D) or 3 (3D) gains are non-zero.
-    ///
-    /// Directions outside the region the speakers span yield all-zero gains, per
-    /// Pulkki §3; see the crate-level docs on coverage.
-    ///
-    /// # Non-finite input
-    ///
-    /// A NaN or infinite `azimuth`/`elevation` yields all-zero gains rather than
-    /// propagating NaN into the output. This is guaranteed, not incidental.
-    /// Debug builds assert on non-finite input, since it indicates a caller bug.
-    #[inline]
-    pub fn compute_gains_into(&self, azimuth: f64, elevation: f64, gains: &mut [f64]) {
-        debug_assert!(
-            gains.len() >= self.config.num_speakers(),
-            "gains slice too small: {} < {}",
-            gains.len(),
-            self.config.num_speakers()
-        );
-        debug_assert!(
-            azimuth.is_finite() && elevation.is_finite(),
-            "non-finite direction: azimuth={}, elevation={}",
-            azimuth,
-            elevation
-        );
-
-        if gains.len() < self.config.num_speakers() {
-            return;
-        }
-
-        self.compute_gains_unchecked(azimuth, elevation, gains);
-    }
-
-    /// Compute speaker gains into a pre-allocated slice, reporting a slice that
-    /// is too small instead of ignoring it.
-    ///
-    /// Identical to [`compute_gains_into`](Self::compute_gains_into) on success.
-    /// The error type is `Copy` and carries no allocation, so this is safe to
-    /// call from an audio thread.
-    ///
-    /// On error the contents of `gains` are left untouched: a partial write
-    /// would silently drop a speaker's gain and produce a wrong mix.
-    #[inline]
-    pub fn try_compute_gains_into(
-        &self,
-        azimuth: f64,
-        elevation: f64,
-        gains: &mut [f64],
-    ) -> core::result::Result<(), PanError> {
-        let need = self.config.num_speakers();
-        if gains.len() < need {
-            return Err(PanError::BufferTooSmall {
-                need: need as u32,
-                got: gains.len() as u32,
-            });
-        }
-
-        self.compute_gains_unchecked(azimuth, elevation, gains);
-        Ok(())
-    }
-
-    /// Compute only the speakers that actually receive signal.
-    ///
-    /// This is the cheapest way to drive a large layout: it does no work
-    /// proportional to the speaker count, where
-    /// [`compute_gains_into`](Self::compute_gains_into) must zero the whole
-    /// output slice on every call even though at most three entries change.
+    /// Returns only the two or three speakers that receive signal. Nothing here
+    /// scales with the speaker count, nothing allocates, nothing locks, and in
+    /// release builds nothing panics — so this is equally suited to an audio
+    /// callback and to offline rendering.
     ///
     /// `cursor` carries the previously selected base. A moving source usually
     /// stays within the same base from one block to the next, so re-testing it
     /// first turns the search into a single hit in the common case. Give each
     /// concurrent source its own cursor; a stale or default cursor only costs
     /// speed, never correctness.
+    ///
+    /// # Output
+    ///
+    /// Gains are normalized so that `Σg² = 1` — Pulkki's Eq. (10)/(19) with the
+    /// paper's volume parameter `C` fixed at 1.0. Scale by `√C` for a different
+    /// level.
+    ///
+    /// The result is empty when the direction lies outside the region the
+    /// speakers span, per Pulkki §3; see the crate-level docs on coverage. It is
+    /// also empty for a NaN or infinite direction, which is guaranteed rather
+    /// than incidental, so `NaN` can never reach an audio buffer. Debug builds
+    /// assert on non-finite input, since it indicates a caller bug.
+    ///
+    /// Use [`ActiveGains::accumulate_into`] to sum into a channel-indexed
+    /// buffer.
     ///
     /// ```
     /// use vbap::{PanCursor, VBAPanner};
@@ -342,11 +250,11 @@ impl VBAPanner {
     /// let mut cursor = PanCursor::default();
     /// let mut mix = vec![0.0; panner.num_speakers()];
     ///
-    /// let active = panner.compute_active_gains(45.0, 0.0, &mut cursor);
+    /// let active = panner.compute_gains(45.0, 0.0, &mut cursor);
     /// active.accumulate_into(&mut mix);
     /// ```
     #[inline]
-    pub fn compute_active_gains(
+    pub fn compute_gains(
         &self,
         azimuth: f64,
         elevation: f64,
@@ -358,6 +266,13 @@ impl VBAPanner {
             azimuth,
             elevation
         );
+
+        // A non-finite direction would make every comparison in `select_base`
+        // false, leaving the first base selected with meaningless factors.
+        // Reject it once here rather than per candidate.
+        if !azimuth.is_finite() || !elevation.is_finite() {
+            return ActiveGains::default();
+        }
 
         let direction = spherical_to_cartesian(azimuth, elevation);
 
@@ -385,15 +300,6 @@ impl VBAPanner {
                 }
             }
         }
-    }
-
-    /// Shared implementation. Caller guarantees `gains.len() >= num_speakers()`.
-    #[inline]
-    fn compute_gains_unchecked(&self, azimuth: f64, elevation: f64, gains: &mut [f64]) {
-        gains.fill(0.0);
-        let mut cursor = PanCursor::default();
-        self.compute_active_gains(azimuth, elevation, &mut cursor)
-            .accumulate_into(gains);
     }
 
     /// Get the number of speakers in this configuration.
@@ -425,12 +331,27 @@ impl VBAPanner {
 #[allow(deprecated)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// Scatter the active gains into a dense per-speaker vector.
+    ///
+    /// Tests assert over whole layouts, so the dense form is the convenient
+    /// shape here even though callers rarely need it.
+    fn dense(panner: &VBAPanner, azimuth: f64, elevation: f64) -> Vec<f64> {
+        let mut gains = vec![0.0; panner.num_speakers()];
+        let mut cursor = PanCursor::default();
+        panner
+            .compute_gains(azimuth, elevation, &mut cursor)
+            .accumulate_into(&mut gains);
+        gains
+    }
     use approx::assert_relative_eq;
 
     #[test]
     fn test_stereo_center() {
         let panner = VBAPanner::builder().stereo().build().unwrap();
-        let gains = panner.compute_gains(0.0, 0.0);
+        let gains = dense(&panner, 0.0, 0.0);
 
         assert_eq!(gains.len(), 2);
         // Center pan should have equal gains
@@ -441,7 +362,7 @@ mod tests {
     fn test_stereo_hard_left() {
         let panner = VBAPanner::builder().stereo().build().unwrap();
         // Stereo is at ±30°, so 30° should be hard left
-        let gains = panner.compute_gains(30.0, 0.0);
+        let gains = dense(&panner, 30.0, 0.0);
 
         assert_eq!(gains.len(), 2);
         // Left speaker (index 0) should be louder
@@ -451,7 +372,7 @@ mod tests {
     #[test]
     fn test_stereo_hard_right() {
         let panner = VBAPanner::builder().stereo().build().unwrap();
-        let gains = panner.compute_gains(-30.0, 0.0);
+        let gains = dense(&panner, -30.0, 0.0);
 
         assert_eq!(gains.len(), 2);
         // Right speaker (index 1) should be louder
@@ -463,7 +384,7 @@ mod tests {
         let panner = VBAPanner::builder().surround_5_1().build().unwrap();
 
         for azi in [-180, -90, -45, 0, 45, 90, 180] {
-            let gains = panner.compute_gains(azi as f64, 0.0);
+            let gains = dense(&panner, azi as f64, 0.0);
             let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
             assert_relative_eq!(sum_sq, 1.0, epsilon = 0.01);
         }
@@ -474,7 +395,7 @@ mod tests {
         let panner = VBAPanner::builder().surround_7_1().build().unwrap();
 
         for azi in (-180..=180).step_by(15) {
-            let gains = panner.compute_gains(azi as f64, 0.0);
+            let gains = dense(&panner, azi as f64, 0.0);
             for g in &gains {
                 assert!(*g >= 0.0, "gain {} at azi {} is negative", g, azi);
             }
@@ -482,11 +403,9 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_gains_into() {
+    fn test_gains_are_power_normalized() {
         let panner = VBAPanner::builder().stereo().build().unwrap();
-        let mut gains = vec![0.0; 2];
-
-        panner.compute_gains_into(15.0, 0.0, &mut gains);
+        let gains = dense(&panner, 15.0, 0.0);
 
         let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
         assert_relative_eq!(sum_sq, 1.0, epsilon = 0.01);
@@ -500,7 +419,7 @@ mod tests {
         assert_eq!(panner.num_speakers(), 11);
 
         // Elevated source should activate height speakers
-        let gains = panner.compute_gains(45.0, 45.0);
+        let gains = dense(&panner, 45.0, 45.0);
 
         // At least one non-zero gain
         assert!(gains.iter().any(|&g| g > 0.0));
@@ -511,8 +430,8 @@ mod tests {
         let panner = VBAPanner::builder().surround_5_1().build().unwrap();
 
         // 450° should produce same gains as 90°
-        let gains_90 = panner.compute_gains(90.0, 0.0);
-        let gains_450 = panner.compute_gains(450.0, 0.0);
+        let gains_90 = dense(&panner, 90.0, 0.0);
+        let gains_450 = dense(&panner, 450.0, 0.0);
         for (a, b) in gains_90.iter().zip(gains_450.iter()) {
             assert_relative_eq!(a, b, epsilon = 1e-9);
         }
@@ -523,7 +442,7 @@ mod tests {
         let panner = VBAPanner::builder().atmos_7_1_4().build().unwrap();
 
         // Directly above — should still produce valid normalized gains
-        let gains = panner.compute_gains(0.0, 90.0);
+        let gains = dense(&panner, 0.0, 90.0);
         assert!(gains.iter().all(|&g| g >= 0.0));
 
         let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
@@ -540,7 +459,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(panner.num_speakers(), 2);
-        let gains = panner.compute_gains(0.0, 0.0);
+        let gains = dense(&panner, 0.0, 0.0);
         assert_relative_eq!(gains[0], gains[1], epsilon = 0.01);
     }
 
@@ -556,35 +475,26 @@ mod tests {
 
         assert_eq!(panner.num_speakers(), 3);
         assert_eq!(panner.mode(), PanningMode::ThreeD);
-        let gains = panner.compute_gains(0.0, 45.0);
+        let gains = dense(&panner, 0.0, 45.0);
         assert!(gains.iter().any(|&g| g > 0.0));
     }
 
+    // Because gains carry their own speaker index, there is no buffer-length
+    // contract to violate: computing gains needs no output slice at all, and
+    // `accumulate_into` writes only within whatever slice it is handed.
     #[test]
-    fn test_try_compute_gains_into_rejects_small_slice() {
+    #[cfg(not(debug_assertions))]
+    fn test_accumulate_into_ignores_out_of_range_speakers() {
         let panner = VBAPanner::builder().surround_5_1().build().unwrap();
-        let mut gains = [0.0; 3];
+        let mut cursor = PanCursor::default();
 
-        let err = panner
-            .try_compute_gains_into(0.0, 0.0, &mut gains)
-            .unwrap_err();
-        assert_eq!(err, PanError::BufferTooSmall { need: 5, got: 3 });
+        // A source at Ls (index 3) would write past a 2-element buffer.
+        let active = panner.compute_gains(110.0, 0.0, &mut cursor);
+        assert!(active.iter().any(|(speaker, _)| speaker >= 2));
 
-        // The buffer must be left untouched rather than partially written.
-        assert_eq!(gains, [0.0; 3]);
-    }
-
-    #[test]
-    fn test_try_compute_gains_into_matches_infallible() {
-        let panner = VBAPanner::builder().surround_5_1().build().unwrap();
-        let mut a = vec![0.0; 5];
-        let mut b = vec![0.0; 5];
-
-        for azi in [-120.0, -30.0, 0.0, 45.0, 170.0] {
-            panner.compute_gains_into(azi, 0.0, &mut a);
-            panner.try_compute_gains_into(azi, 0.0, &mut b).unwrap();
-            assert_eq!(a, b);
-        }
+        let mut undersized = [0.0; 2];
+        active.accumulate_into(&mut undersized);
+        assert_eq!(undersized, [0.0; 2], "wrote outside the provided slice");
     }
 
     // Non-finite input trips a `debug_assert!` by design — it means the caller
@@ -594,7 +504,7 @@ mod tests {
     #[cfg(not(debug_assertions))]
     fn test_non_finite_input_yields_silence() {
         let panner = VBAPanner::builder().surround_5_1().build().unwrap();
-        let mut gains = vec![0.0; 5];
+        let mut cursor = PanCursor::default();
 
         for (azi, ele) in [
             (f64::NAN, 0.0),
@@ -604,11 +514,10 @@ mod tests {
             (f64::NEG_INFINITY, 0.0),
             (0.0, f64::INFINITY),
         ] {
-            gains.fill(1.0);
-            panner.try_compute_gains_into(azi, ele, &mut gains).unwrap();
+            let active = panner.compute_gains(azi, ele, &mut cursor);
             assert!(
-                gains.iter().all(|g| *g == 0.0),
-                "non-finite input ({azi}, {ele}) produced {gains:?}"
+                active.is_empty(),
+                "non-finite input ({azi}, {ele}) produced {active:?}"
             );
         }
     }
@@ -620,7 +529,7 @@ mod tests {
         // speaker instead.
         let panner = VBAPanner::builder().atmos_7_1_4().build().unwrap();
         let mut gains = vec![0.0; panner.num_speakers()];
-        panner.compute_gains_into(0.0, 0.0, &mut gains);
+        gains = dense(&panner, 0.0, 0.0);
 
         assert_relative_eq!(gains[2], 1.0, epsilon = 1e-9);
         for (i, g) in gains.iter().enumerate() {
@@ -652,7 +561,7 @@ mod tests {
         for (name, panner) in configs {
             let mut gains = vec![0.0; panner.num_speakers()];
             for (i, speaker) in panner.speakers().iter().enumerate() {
-                panner.compute_gains_into(speaker.azimuth(), speaker.elevation(), &mut gains);
+                gains = dense(&panner, speaker.azimuth(), speaker.elevation());
                 assert_relative_eq!(gains[i], 1.0, epsilon = 1e-9);
                 let leaked: f64 = gains
                     .iter()
@@ -674,7 +583,7 @@ mod tests {
         let mut gains = vec![0.0; 3];
 
         for azimuth in [-180.0, -120.0, -90.0, -45.0, -31.0, 31.0, 90.0, 150.0] {
-            panner.compute_gains_into(azimuth, 0.0, &mut gains);
+            gains = dense(&panner, azimuth, 0.0);
             assert!(
                 gains.iter().all(|g| *g == 0.0),
                 "azimuth {azimuth} should be outside the arc, got {gains:?}"
@@ -684,7 +593,7 @@ mod tests {
         // ...while everything inside the arc keeps unit power.
         let mut azimuth = -30.0;
         while azimuth <= 30.0 {
-            panner.compute_gains_into(azimuth, 0.0, &mut gains);
+            gains = dense(&panner, azimuth, 0.0);
             let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
             assert_relative_eq!(sum_sq, 1.0, epsilon = 1e-9);
             azimuth += 0.5;
@@ -710,7 +619,7 @@ mod tests {
             let mut gains = vec![0.0; panner.num_speakers()];
             let mut azimuth = -180.0;
             while azimuth < 180.0 {
-                panner.compute_gains_into(azimuth, 0.0, &mut gains);
+                gains = dense(&panner, azimuth, 0.0);
                 let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
                 assert_relative_eq!(sum_sq, 1.0, epsilon = 1e-9);
                 azimuth += 0.5;
@@ -725,10 +634,10 @@ mod tests {
         let mut prev = vec![0.0; 3];
         let mut cur = vec![0.0; 3];
 
-        panner.compute_gains_into(-30.0, 0.0, &mut prev);
+        prev = dense(&panner, -30.0, 0.0);
         let mut azimuth = -30.0;
         while azimuth <= 30.0 {
-            panner.compute_gains_into(azimuth, 0.0, &mut cur);
+            cur = dense(&panner, azimuth, 0.0);
             let delta: f64 = prev
                 .iter()
                 .zip(cur.iter())
@@ -742,34 +651,31 @@ mod tests {
     }
 
     #[test]
-    fn test_active_gains_match_dense_output() {
-        // The sparse and dense paths must agree exactly, including which
-        // directions produce nothing at all.
+    fn test_gains_are_well_formed_everywhere() {
+        // Across the sphere: never more than three active speakers, indices
+        // always in range, and either unit power or nothing at all.
         for panner in [
             VBAPanner::builder().stereo().build().unwrap(),
             VBAPanner::builder().lcr().build().unwrap(),
             VBAPanner::builder().surround_7_1().build().unwrap(),
             VBAPanner::builder().atmos_7_1_4().build().unwrap(),
         ] {
-            let n = panner.num_speakers();
-            let mut dense = vec![0.0; n];
-            let mut sparse = vec![0.0; n];
+            let n = panner.num_speakers() as u32;
             let mut cursor = PanCursor::default();
 
             for step in 0..720 {
                 let azimuth = -180.0 + step as f64 * 0.5;
                 for elevation in [-30.0, 0.0, 30.0, 60.0] {
-                    panner.compute_gains_into(azimuth, elevation, &mut dense);
+                    let active = panner.compute_gains(azimuth, elevation, &mut cursor);
 
-                    sparse.fill(0.0);
-                    let active = panner.compute_active_gains(azimuth, elevation, &mut cursor);
-                    active.accumulate_into(&mut sparse);
-
-                    assert_eq!(
-                        dense, sparse,
-                        "mismatch at azimuth {azimuth}, elevation {elevation}"
-                    );
                     assert!(active.len() <= 3);
+                    assert!(active.iter().all(|(speaker, _)| speaker < n));
+                    assert!(active.iter().all(|(_, gain)| gain >= 0.0));
+
+                    let sum_sq: f64 = active.iter().map(|(_, g)| g * g).sum();
+                    if !active.is_empty() {
+                        assert_relative_eq!(sum_sq, 1.0, epsilon = 1e-9);
+                    }
                 }
             }
         }
@@ -783,13 +689,13 @@ mod tests {
         let mut reused = PanCursor::default();
 
         // Drive `reused` somewhere unrelated first.
-        panner.compute_active_gains(150.0, 40.0, &mut reused);
+        panner.compute_gains(150.0, 40.0, &mut reused);
 
         for step in 0..360 {
             let azimuth = -180.0 + step as f64;
-            let a = panner.compute_active_gains(azimuth, 20.0, &mut PanCursor::default());
-            let b = panner.compute_active_gains(azimuth, 20.0, &mut fresh);
-            let c = panner.compute_active_gains(azimuth, 20.0, &mut reused);
+            let a = panner.compute_gains(azimuth, 20.0, &mut PanCursor::default());
+            let b = panner.compute_gains(azimuth, 20.0, &mut fresh);
+            let c = panner.compute_gains(azimuth, 20.0, &mut reused);
             assert_eq!(a, b);
             assert_eq!(a, c);
         }
@@ -802,8 +708,8 @@ mod tests {
         let mut cursor = PanCursor::default();
         let mut mix = vec![0.0; panner.num_speakers()];
 
-        let a = panner.compute_active_gains(30.0, 0.0, &mut cursor);
-        let b = panner.compute_active_gains(-30.0, 0.0, &mut cursor);
+        let a = panner.compute_gains(30.0, 0.0, &mut cursor);
+        let b = panner.compute_gains(-30.0, 0.0, &mut cursor);
         a.accumulate_into(&mut mix);
         b.accumulate_into(&mut mix);
 
