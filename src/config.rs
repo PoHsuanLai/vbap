@@ -14,12 +14,20 @@ use crate::presets;
 use crate::speaker::Speaker;
 use glam::{DMat2, DMat3, DVec2, DVec3};
 
-/// Minimum angular distance between speakers to form a valid pair/triplet.
-const MIN_PAIR_ANGLE: f64 = 0.0872665; // ~5 degrees in radians
+/// Minimum azimuth separation, in degrees, for two speakers to form a pair.
+///
+/// This only rejects speakers that are effectively coincident. Pulkki (1997)
+/// §6.2 validates bases as narrow as 5°, and dense rings (a 100-speaker array is
+/// 3.6° apart) must still build, so the floor is well below that.
+const MIN_PAIR_ANGLE_DEG: f64 = 0.01;
 
-/// Maximum angular distance for a speaker pair (prevents wrapping issues).
-/// Approximately 175 degrees.
-const MAX_PAIR_ANGLE: f64 = 3.0543; // π - 0.0873 radians
+/// Largest azimuth gap, in degrees, that still gets a wrap-around pair.
+///
+/// Doubles as the maximum width of any pair: the ring is closed only if the
+/// closing pair would itself be valid. Measured gaps separate cleanly — closed
+/// layouts reach at most 140° (5.1's rear), while open ones start at 240°
+/// (a frontal array) — so any threshold in (140°, 240°] works.
+const MAX_WRAP_GAP_DEG: f64 = 175.0;
 
 /// Tolerance for "this point lies outside that face's plane" during hull
 /// construction.
@@ -289,18 +297,45 @@ fn choose_speaker_pairs(speakers: &[Speaker]) -> Result<Vec<SpeakerTuple>> {
     let mut sorted_indices: Vec<usize> = (0..n).collect();
     sorted_indices.sort_by(|&a, &b| speakers[a].azimuth().total_cmp(&speakers[b].azimuth()));
 
-    // Create pairs from adjacent speakers (in sorted order)
-    let tuples = (0..n)
-        .filter_map(|i| {
-            let idx1 = sorted_indices[i];
-            let idx2 = sorted_indices[(i + 1) % n];
+    // Pairs from adjacent speakers, per Pulkki (1997) §1.3.
+    let mut pair_indices: Vec<(usize, usize)> = (0..n - 1)
+        .map(|i| (sorted_indices[i], sorted_indices[i + 1]))
+        .collect();
 
+    // Close the ring only when the remaining gap is small enough to be a
+    // legitimate pair. A layout that does not surround the listener (stereo,
+    // LCR, a frontal array) leaves a wide gap behind it; spanning that gap
+    // creates a base whose active arc also covers the front, where it wins the
+    // "highest smallest factor" contest and silences the speakers actually
+    // pointing that way.
+    //
+    // The gap is measured in azimuth, not as a great-circle angle: the latter
+    // folds into [0°, 180°], so a 300° rear gap would read as 60° and wrap.
+    //
+    // With n == 2 the single pair already joins both speakers; wrapping would
+    // emit that same pair a second time.
+    if n >= 3 {
+        let first = speakers[sorted_indices[0]].azimuth();
+        let last = speakers[sorted_indices[n - 1]].azimuth();
+        let gap = 360.0 - (last - first);
+        if gap <= MAX_WRAP_GAP_DEG {
+            pair_indices.push((sorted_indices[n - 1], sorted_indices[0]));
+        }
+    }
+
+    let tuples = pair_indices
+        .into_iter()
+        .filter_map(|(idx1, idx2)| {
             let s1 = &speakers[idx1];
             let s2 = &speakers[idx2];
 
-            // Skip pairs that are too close or too far apart
-            let angle = s1.cartesian().angle_between(s2.cartesian());
-            if !(MIN_PAIR_ANGLE..=MAX_PAIR_ANGLE).contains(&angle) {
+            // Skip pairs that are too close or too far apart. Measured in
+            // azimuth to match the matrix built below, which uses azimuth only.
+            let mut delta = (s1.azimuth() - s2.azimuth()).abs();
+            if delta > 180.0 {
+                delta = 360.0 - delta;
+            }
+            if !(MIN_PAIR_ANGLE_DEG..=MAX_WRAP_GAP_DEG).contains(&delta) {
                 return None;
             }
 

@@ -12,6 +12,16 @@ use crate::math::spherical_to_cartesian;
 use crate::speaker::Speaker;
 use glam::DVec2;
 
+/// How negative a gain factor may be before the direction counts as lying
+/// outside every active region.
+///
+/// Pulkki (1997) §1.4 notes that limited numerical accuracy "may produce
+/// slightly negative gain factors in some cases"; those are clamped to zero. A
+/// factor more negative than this is not noise — it means the direction is
+/// genuinely outside the arc, which only happens on layouts that do not
+/// surround the listener.
+const OUT_OF_ARC_TOLERANCE: f64 = 1e-6;
+
 /// Vector Base Amplitude Panner.
 ///
 /// Computes speaker gains for positioning sound sources in a multichannel
@@ -193,15 +203,27 @@ impl VBAPanner {
             }
         }
 
+        // A clearly negative factor means the direction lies outside every
+        // active region: no combination of these speakers points there. Pulkki
+        // (1997) §3: "the virtual source can not be positioned outside the
+        // active arc or region." Leave the gains at zero rather than clamping
+        // and renormalizing, which would rescale the surviving component back to
+        // full level and produce a phantom the layout cannot actually render.
+        //
+        // Only closed layouts cover every direction; open ones (stereo, LCR, a
+        // frontal array) fall outside behind the listener.
+        if best_min_gain < -OUT_OF_ARC_TOLERANCE {
+            return;
+        }
+
         // Apply the winning gains
         let best_tuple = &tuples[best_tuple_idx];
 
-        // Clamp negative factors to zero *before* normalizing. Pulkki (1997)
-        // §1.4: "The negative factor must be set to zero before normalization."
-        // Inside the active region every factor is already non-negative, so this
-        // is a no-op there. Outside it, clamping first keeps the surviving gains
-        // at full level instead of spending part of the power budget on a
-        // negative factor that is then discarded.
+        // Clamp the remaining slightly-negative factors to zero *before*
+        // normalizing. Pulkki (1997) §1.4: "The negative factor must be set to
+        // zero before normalization." These are numerical noise at an arc
+        // boundary, so this is a no-op everywhere except within a hair of an
+        // edge, where it keeps the surviving gains at full level.
         for gain in best_gains[..best_len].iter_mut() {
             *gain = gain.max(0.0);
         }
@@ -434,6 +456,134 @@ mod tests {
                 gains.iter().all(|g| *g == 0.0),
                 "non-finite input ({azi}, {ele}) produced {gains:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_center_speaker_audible_dead_ahead() {
+        // Regression: the centre channel used to be orphaned by triplet
+        // selection, so dialogue panned straight ahead came out of the left
+        // speaker instead.
+        let panner = VBAPanner::builder().atmos_7_1_4().build().unwrap();
+        let mut gains = vec![0.0; panner.num_speakers()];
+        panner.compute_gains_into(0.0, 0.0, &mut gains);
+
+        assert_relative_eq!(gains[2], 1.0, epsilon = 1e-9);
+        for (i, g) in gains.iter().enumerate() {
+            if i != 2 {
+                assert_relative_eq!(*g, 0.0, epsilon = 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn test_property_one_all_presets() {
+        // Pulkki §3, property 1: a source in the same direction as a speaker
+        // emanates from that speaker alone.
+        let configs: [(&str, VBAPanner); 6] = [
+            ("stereo", VBAPanner::builder().stereo().build().unwrap()),
+            ("lcr", VBAPanner::builder().lcr().build().unwrap()),
+            ("5.1", VBAPanner::builder().surround_5_1().build().unwrap()),
+            ("7.1", VBAPanner::builder().surround_7_1().build().unwrap()),
+            (
+                "atmos_7_1_4",
+                VBAPanner::builder().atmos_7_1_4().build().unwrap(),
+            ),
+            (
+                "atmos_5_1_4",
+                VBAPanner::builder().atmos_5_1_4().build().unwrap(),
+            ),
+        ];
+
+        for (name, panner) in configs {
+            let mut gains = vec![0.0; panner.num_speakers()];
+            for (i, speaker) in panner.speakers().iter().enumerate() {
+                panner.compute_gains_into(speaker.azimuth(), speaker.elevation(), &mut gains);
+                assert_relative_eq!(gains[i], 1.0, epsilon = 1e-9);
+                let leaked: f64 = gains
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, _)| *k != i)
+                    .map(|(_, g)| g.abs())
+                    .sum();
+                assert!(leaked < 1e-9, "{name}: speaker {i} leaked {leaked}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_open_layout_is_silent_outside_arc() {
+        // Pulkki §3: a source cannot be positioned outside the active region.
+        // An LCR rig spans -30..30 only, so the rear must be silent rather than
+        // rendering a full-level phantom.
+        let panner = VBAPanner::builder().lcr().build().unwrap();
+        let mut gains = vec![0.0; 3];
+
+        for azimuth in [-180.0, -120.0, -90.0, -45.0, -31.0, 31.0, 90.0, 150.0] {
+            panner.compute_gains_into(azimuth, 0.0, &mut gains);
+            assert!(
+                gains.iter().all(|g| *g == 0.0),
+                "azimuth {azimuth} should be outside the arc, got {gains:?}"
+            );
+        }
+
+        // ...while everything inside the arc keeps unit power.
+        let mut azimuth = -30.0;
+        while azimuth <= 30.0 {
+            panner.compute_gains_into(azimuth, 0.0, &mut gains);
+            let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
+            assert_relative_eq!(sum_sq, 1.0, epsilon = 1e-9);
+            azimuth += 0.5;
+        }
+    }
+
+    #[test]
+    fn test_stereo_forms_single_pair() {
+        // Two speakers describe one arc; the modular wrap used to emit it twice.
+        let panner = VBAPanner::builder().stereo().build().unwrap();
+        assert_eq!(panner.config().tuples().len(), 1);
+    }
+
+    #[test]
+    fn test_closed_layouts_cover_every_direction() {
+        // A layout that surrounds the listener must render every azimuth.
+        for panner in [
+            VBAPanner::builder().surround_5_1().build().unwrap(),
+            VBAPanner::builder().surround_7_1().build().unwrap(),
+            VBAPanner::builder().quad().build().unwrap(),
+            VBAPanner::builder().octagon().build().unwrap(),
+        ] {
+            let mut gains = vec![0.0; panner.num_speakers()];
+            let mut azimuth = -180.0;
+            while azimuth < 180.0 {
+                panner.compute_gains_into(azimuth, 0.0, &mut gains);
+                let sum_sq: f64 = gains.iter().map(|g| g * g).sum();
+                assert_relative_eq!(sum_sq, 1.0, epsilon = 1e-9);
+                azimuth += 0.5;
+            }
+        }
+    }
+
+    #[test]
+    fn test_gain_continuity_2d() {
+        // No audible jumps as a source sweeps through the covered region.
+        let panner = VBAPanner::builder().lcr().build().unwrap();
+        let mut prev = vec![0.0; 3];
+        let mut cur = vec![0.0; 3];
+
+        panner.compute_gains_into(-30.0, 0.0, &mut prev);
+        let mut azimuth = -30.0;
+        while azimuth <= 30.0 {
+            panner.compute_gains_into(azimuth, 0.0, &mut cur);
+            let delta: f64 = prev
+                .iter()
+                .zip(cur.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f64>()
+                .sqrt();
+            assert!(delta < 0.05, "jump of {delta} at azimuth {azimuth}");
+            core::mem::swap(&mut prev, &mut cur);
+            azimuth += 0.25;
         }
     }
 
