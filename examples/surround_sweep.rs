@@ -32,6 +32,10 @@ fn main() {
     // WAV 5.1 channel order: L, R, C, LFE, Ls, Rs
     let gain_to_wav = [0, 1, 2, usize::MAX, 3, 4]; // MAX = LFE (silent)
 
+    // Reused across the whole render so the sample loop never allocates —
+    // the same pattern an audio callback would use.
+    let mut gains = vec![0.0; panner.num_speakers()];
+
     for i in 0..total_samples {
         let t = i as f64 / sample_rate as f64;
         let sample = noise();
@@ -45,7 +49,7 @@ fn main() {
             azimuth
         };
 
-        let gains = panner.compute_gains(azimuth, 0.0);
+        panner.compute_gains_into(azimuth, 0.0, &mut gains);
 
         for &idx in &gain_to_wav {
             let value = if idx == usize::MAX {

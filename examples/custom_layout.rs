@@ -1,5 +1,4 @@
-#![allow(deprecated)]
-use vbap::VBAPanner;
+use vbap::{PanCursor, VBAPanner};
 
 fn main() {
     // Build a custom 5-speaker layout: an asymmetric setup
@@ -17,18 +16,19 @@ fn main() {
     println!("Custom 5-speaker layout: FC(0°) FL(50°) FR(-40°) RL(130°) RR(-120°)");
     println!();
 
-    for deg in (-180..=180).step_by(15) {
-        let gains = panner.compute_gains(deg as f64, 0.0);
+    // `compute_active_gains` hands back only the speakers that receive signal,
+    // which is exactly what this display needs. The cursor lets a sweeping
+    // source skip the base search while it stays in the same pair.
+    let mut cursor = PanCursor::default();
 
-        // Show only active speakers
-        let active: Vec<String> = labels
+    for deg in (-180..=180).step_by(15) {
+        let active: Vec<String> = panner
+            .compute_active_gains(deg as f64, 0.0, &mut cursor)
             .iter()
-            .zip(gains.iter())
-            .filter(|(_, &g)| g > 0.001)
-            .map(|(label, &g)| {
-                let bar_len = (g * 20.0) as usize;
-                let bar: String = "█".repeat(bar_len);
-                format!("{label} {bar} {g:.2}")
+            .filter(|(_, gain)| *gain > 0.001)
+            .map(|(speaker, gain)| {
+                let bar: String = "█".repeat((gain * 20.0) as usize);
+                format!("{} {bar} {gain:.2}", labels[speaker as usize])
             })
             .collect();
 
