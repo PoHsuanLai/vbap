@@ -22,7 +22,17 @@ const MIN_PAIR_ANGLE: f64 = 0.0872665; // ~5 degrees in radians
 const MAX_PAIR_ANGLE: f64 = 3.0543; // π - 0.0873 radians
 
 /// Minimum volume/side ratio for valid 3D triplets.
-const MIN_VOL_P_SIDE_LGTH: f64 = 0.01;
+///
+/// This exists only to reject triplets that are numerically degenerate (three
+/// speakers so close to a common plane through the origin that the inverse
+/// matrix is unusable). It is deliberately loose: Pulkki (1997) §6.2 reports
+/// that a triangle with sides 5°, 175°, 175° still produces correct gains, and
+/// that with 32-bit accuracy the method "does not set limitations on the
+/// placement of the loudspeakers". That triangle scores ~6.1e-4 here, so the
+/// previous 0.01 threshold rejected geometry the paper explicitly validates.
+/// This crate computes in f64, so it has more headroom than Pulkki's tool, not
+/// less. The determinant check below is the real guard against singular bases.
+const MIN_VOL_P_SIDE_LGTH: f64 = 1e-6;
 
 /// Panning mode for VBAP computation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
