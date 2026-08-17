@@ -14,6 +14,6 @@ pub mod speaker;
 pub use config::{
     Dimension, PanningMode, SpeakerConfig, SpeakerConfigBuilder, SpeakerPair, SpeakerTriplet,
 };
-pub use error::{PanError, Result, VBAPError};
+pub use error::{Result, VBAPError};
 pub use panner::{ActiveGains, PanCursor, VBAPanner};
 pub use speaker::Speaker;

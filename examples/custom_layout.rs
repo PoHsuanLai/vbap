@@ -16,14 +16,14 @@ fn main() {
     println!("Custom 5-speaker layout: FC(0°) FL(50°) FR(-40°) RL(130°) RR(-120°)");
     println!();
 
-    // `compute_active_gains` hands back only the speakers that receive signal,
-    // which is exactly what this display needs. The cursor lets a sweeping
-    // source skip the base search while it stays in the same pair.
+    // `compute_gains` hands back only the speakers that receive signal, which
+    // is exactly what this display needs. The cursor lets a sweeping source
+    // skip the base search while it stays in the same pair.
     let mut cursor = PanCursor::default();
 
     for deg in (-180..=180).step_by(15) {
         let active: Vec<String> = panner
-            .compute_active_gains(deg as f64, 0.0, &mut cursor)
+            .compute_gains(deg as f64, 0.0, &mut cursor)
             .iter()
             .filter(|(_, gain)| *gain > 0.001)
             .map(|(speaker, gain)| {

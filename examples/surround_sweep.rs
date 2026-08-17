@@ -1,4 +1,4 @@
-use vbap::VBAPanner;
+use vbap::{PanCursor, VBAPanner};
 
 fn main() {
     // 5.1 surround: L(30°), R(-30°), C(0°), Ls(110°), Rs(-110°)
@@ -35,6 +35,7 @@ fn main() {
     // Reused across the whole render so the sample loop never allocates —
     // the same pattern an audio callback would use.
     let mut gains = vec![0.0; panner.num_speakers()];
+    let mut cursor = PanCursor::default();
 
     for i in 0..total_samples {
         let t = i as f64 / sample_rate as f64;
@@ -49,7 +50,11 @@ fn main() {
             azimuth
         };
 
-        panner.compute_gains_into(azimuth, 0.0, &mut gains);
+        // Scatter into channel order for the interleaved WAV frame.
+        gains.fill(0.0);
+        panner
+            .compute_gains(azimuth, 0.0, &mut cursor)
+            .accumulate_into(&mut gains);
 
         for &idx in &gain_to_wav {
             let value = if idx == usize::MAX {

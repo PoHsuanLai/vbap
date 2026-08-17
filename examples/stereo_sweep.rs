@@ -1,5 +1,5 @@
 use std::f64::consts::PI;
-use vbap::VBAPanner;
+use vbap::{PanCursor, VBAPanner};
 
 fn main() {
     let panner = VBAPanner::builder().stereo().build().unwrap();
@@ -31,6 +31,7 @@ fn main() {
     // Reused across the whole render so the sample loop never allocates —
     // the same pattern an audio callback would use.
     let mut gains = vec![0.0; panner.num_speakers()];
+    let mut cursor = PanCursor::default();
 
     for i in 0..total_samples {
         let t = i as f64 / sample_rate as f64;
@@ -40,7 +41,11 @@ fn main() {
 
         // Ping-pong azimuth: sin oscillates between -1..1, map to -30..30
         let azimuth = 30.0 * (t * sweep_hz * 2.0 * PI).sin();
-        panner.compute_gains_into(azimuth, 0.0, &mut gains);
+        // Scatter into channel order for the interleaved WAV frame.
+        gains.fill(0.0);
+        panner
+            .compute_gains(azimuth, 0.0, &mut cursor)
+            .accumulate_into(&mut gains);
 
         let left = (sample * gains[0] * i16::MAX as f64) as i16;
         let right = (sample * gains[1] * i16::MAX as f64) as i16;

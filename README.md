@@ -9,44 +9,44 @@
 
 ## Usage
 
+`compute_gains` returns the two or three speakers that receive signal, each
+paired with its gain. Nothing scales with the speaker count.
+
 ```rust
-use vbap::VBAPanner;
+use vbap::{PanCursor, VBAPanner};
 
 let panner = VBAPanner::builder()
     .stereo()
     .build()
     .unwrap();
 
-// Write into a buffer you own — no allocation per call.
-let mut gains = vec![0.0; panner.num_speakers()];
-panner.compute_gains_into(15.0, 0.0, &mut gains); // 15° left
+// One cursor per source; it remembers the last speaker base, so a moving
+// source usually skips the search entirely.
+let mut cursor = PanCursor::default();
+
+for (speaker, gain) in panner.compute_gains(15.0, 0.0, &mut cursor).iter() {
+    println!("speaker {speaker}: {gain:.3}"); // 15° left
+}
 ```
 
-## Real-time use
-
-On an audio thread, prefer `compute_active_gains`. It returns only the two or
-three speakers that actually receive signal, so it does no work proportional to
-the speaker count, and it accumulates into a mix buffer you clear once per block
-rather than once per source.
+To drive a channel-indexed buffer, `accumulate_into` adds the gains in place, so
+many sources sum into one buffer that you clear once per block:
 
 ```rust
 use vbap::{PanCursor, VBAPanner};
 
 let panner = VBAPanner::builder().atmos_7_1_4().build().unwrap();
-
-// One cursor per source; it remembers the last speaker base, so a moving
-// source usually skips the search entirely.
 let mut cursor = PanCursor::default();
 let mut mix = vec![0.0; panner.num_speakers()];
 
-let active = panner.compute_active_gains(45.0, 30.0, &mut cursor);
-active.accumulate_into(&mut mix);
+panner
+    .compute_gains(45.0, 30.0, &mut cursor)
+    .accumulate_into(&mut mix);
 ```
 
-Both entry points allocate nothing, take no locks, and cannot panic in release
-builds. `VBAPanner` is `Send + Sync`, so one panner can serve many voices
-concurrently. Use `try_compute_gains_into` when the output length is not
-statically known.
+This allocates nothing, takes no locks, and cannot panic in release builds, so
+the same call suits an audio callback and offline rendering alike. `VBAPanner`
+is `Send + Sync`, so one panner can serve many voices concurrently.
 
 ## Presets
 
@@ -74,15 +74,16 @@ Adding a speaker with non-zero elevation switches the panner to 3D
 automatically, using speaker triplets instead of pairs:
 
 ```rust
-use vbap::VBAPanner;
+use vbap::{PanCursor, VBAPanner};
 
 let panner = VBAPanner::builder()
     .atmos_7_1_4()  // 7.1 base layer plus four height speakers
     .build()
     .unwrap();
 
-let mut gains = vec![0.0; panner.num_speakers()];
-panner.compute_gains_into(45.0, 30.0, &mut gains);
+let mut cursor = PanCursor::default();
+let active = panner.compute_gains(45.0, 30.0, &mut cursor);
+assert_eq!(active.len(), 3); // a triplet, since the layout is 3D
 ```
 
 ## Angles

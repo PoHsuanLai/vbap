@@ -11,9 +11,9 @@ Gains change for most layouts in this release. Every change is a bug fix — the
 previous output violated properties the VBAP paper states explicitly — so there
 is no way to opt back into the old behaviour.
 
-Upgrading from 0.1.1, the last published release: 0.1.2 was tagged in the
-repository but never released, so its deprecation of `compute_gains` in favour
-of `compute_gains_into` arrives here too.
+0.1.1 is the last published release; 0.1.2 was committed but never released, so
+upgrading skips it. `compute_gains` still exists but has a new signature and
+return type — see **Changed** below.
 
 ### Fixed
 
@@ -61,41 +61,34 @@ of `compute_gains_into` arrives here too.
 
 - `stereo()` produced the same pair twice.
 
-### Added
+### Changed
 
-- `VBAPanner::compute_active_gains`, returning only the two or three speakers
-  that actually receive signal as an `ActiveGains` value. It does no work
-  proportional to the speaker count, where `compute_gains_into` must zero the
-  whole output slice on every call. `ActiveGains::accumulate_into` sums into a
-  mix buffer, so a mixer clears once per block rather than once per source.
+- **There is now one way to compute gains.** `compute_gains` takes a
+  `PanCursor` and returns an `ActiveGains` — the two or three speakers that
+  receive signal, each with its gain. It replaces the previous four entry
+  points (`compute_gains`, `compute_gains_into`, `try_compute_gains_into`, and
+  `compute_active_gains`), which differed only in output shape and in how they
+  reported a too-small buffer.
+
+  ```rust
+  // before
+  let mut gains = vec![0.0; panner.num_speakers()];
+  panner.compute_gains_into(45.0, 30.0, &mut gains);
+
+  // after
+  let mut cursor = PanCursor::default();
+  panner.compute_gains(45.0, 30.0, &mut cursor).accumulate_into(&mut gains);
+  ```
+
+  Nothing scales with the speaker count, nothing allocates, nothing locks, and
+  nothing panics in release, so the same call serves an audio callback and
+  offline rendering. There is no longer a "real-time" variant to choose,
+  because the ordinary path already meets that bar.
 
   Measured against the previous release (2M calls along a moving-source path):
   64-speaker ring `78.7 → 13.4 ns` (5.9x), 128-speaker ring `→ 19.2 ns`,
-  Atmos 7.1.4 `30.4 → 17.5 ns` (1.7x). Both paths remain allocation-free,
-  verified with a counting allocator.
-
-- `PanCursor`, which remembers the last selected base so a moving source can
-  skip the search while it stays inside that base. Held by the caller rather
-  than the panner, which keeps `&VBAPanner` `Sync` — one panner can still be
-  shared across voices and threads — and gives each source its own coherence.
-  A default or stale cursor only costs speed, never correctness.
-
-- `VBAPanner::try_compute_gains_into`, returning `Result<(), PanError>` for a
-  too-small output slice. `PanError` is `Copy` and allocation-free, so it is safe
-  to use on an audio thread.
-- Non-finite (`NaN`/infinite) input is now *guaranteed* to yield all-zero gains
-  rather than leaking `NaN` into the output buffer.
-- `SpeakerConfig::pairs`, `SpeakerConfig::triplets`, and
-  `SpeakerConfig::num_bases`.
-
-### Changed
-
-- **`compute_gains_into` no longer panics in release builds.** The length check
-  is now a `debug_assert!`; unwinding out of an audio callback is undefined
-  behaviour under most host ABIs. Use `try_compute_gains_into` when the length is
-  not statically known.
-- Better error messages when no valid bases can be formed — in particular for a
-  fully horizontal layout built with `Dimension::Force3D`.
+  Atmos 7.1.4 `30.4 → 17.5 ns` (1.7x). Allocation-free, verified with a
+  counting allocator.
 
 - Bases are now stored per mode (`Vec<SpeakerPair>` or `Vec<SpeakerTriplet>`)
   with inline `[u32; N]` indices, instead of one `Vec<SpeakerTuple>` of enums
@@ -103,7 +96,29 @@ of `compute_gains_into` arrives here too.
   per call rather than once per candidate base, which also lets the search loop
   vectorize.
 
+- Better error messages when no valid bases can be formed — in particular for a
+  fully horizontal layout built with `Dimension::Force3D`.
+
+### Added
+
+- `PanCursor`, which remembers the last selected base so a moving source can
+  skip the search while it stays inside that base. Held by the caller rather
+  than the panner, which keeps `&VBAPanner` `Sync` — one panner can still be
+  shared across voices and threads — and gives each source its own coherence.
+  A default or stale cursor only costs speed, never correctness.
+- `ActiveGains`, with `iter`, `len`, `is_empty`, and `accumulate_into`. The
+  last adds into a channel-indexed buffer, so many sources sum into one buffer
+  that the caller clears once per block rather than once per source.
+- Non-finite (`NaN`/infinite) input is now *guaranteed* to yield no gains
+  rather than leaking `NaN` into the output buffer.
+- `SpeakerConfig::pairs`, `SpeakerConfig::triplets`, and
+  `SpeakerConfig::num_bases`.
+
 ### Removed
+
+- `compute_gains_into`, `try_compute_gains_into`, `compute_active_gains`, and
+  the `PanError` type they needed. Gains carry their own speaker index, so
+  there is no output-slice length to validate and no error case left to report.
 
 - `SpeakerTuple`, `InverseMatrix`, and `SpeakerConfig::tuples()`, replaced by
   `SpeakerPair`, `SpeakerTriplet`, and the `pairs()`/`triplets()` accessors.
