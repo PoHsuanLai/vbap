@@ -2,6 +2,7 @@
 //!
 //! Uses `glam` for SIMD-optimized vector operations.
 
+use alloc::vec::Vec;
 use glam::DVec3;
 
 /// Convert spherical coordinates (azimuth, elevation in degrees) to Cartesian unit vector.
@@ -42,46 +43,144 @@ pub fn cartesian_to_spherical(v: DVec3) -> (f64, f64) {
     (azimuth, elevation)
 }
 
-/// Check if two great circle arcs intersect on a unit sphere.
+/// Compute the convex hull of a set of 3D points as outward-oriented triangles.
 ///
-/// Arc 1: from a1 to a2
-/// Arc 2: from b1 to b2
+/// Uses incremental (horizon-edge) construction. The face set stays a closed
+/// manifold at every step, which is what keeps coplanar clusters — such as the
+/// horizontal speaker ring present in every surround layout — from producing
+/// contradictory, mutually overlapping faces.
 ///
-/// Based on Pulkki's VBAP implementation.
-#[inline]
-pub(crate) fn lines_intersect(a1: DVec3, a2: DVec3, b1: DVec3, b2: DVec3) -> bool {
-    // Normal vectors to the planes containing each arc
-    let n1 = a1.cross(a2);
-    let n2 = b1.cross(b2);
-
-    // Line of intersection between the two planes
-    let intersection = n1.cross(n2);
-
-    let int_normalized = intersection.normalize_or_zero();
-    if int_normalized == DVec3::ZERO {
-        // Planes are parallel (arcs are on the same great circle)
-        return false;
+/// Faces are oriented so their normals point away from the hull interior.
+///
+/// Returns an empty `Vec` when the points are coplanar, since no 3D hull exists.
+pub(crate) fn convex_hull(pts: &[DVec3], eps: f64) -> Vec<[usize; 3]> {
+    let n = pts.len();
+    if n < 4 {
+        return Vec::new();
     }
 
-    // Two potential intersection points (antipodal)
-    let p1 = int_normalized;
-    let p2 = -int_normalized;
+    // --- Seed a non-degenerate tetrahedron -------------------------------
+    // Two most distant points.
+    let (mut i0, mut i1, mut best) = (0usize, 1usize, -1.0f64);
+    for a in 0..n {
+        for b in (a + 1)..n {
+            let d = pts[a].distance_squared(pts[b]);
+            if d > best {
+                best = d;
+                i0 = a;
+                i1 = b;
+            }
+        }
+    }
+    if best <= eps * eps {
+        return Vec::new(); // all points coincident
+    }
 
-    // Check if either intersection point lies on both arcs
-    (point_on_arc(p1, a1, a2) && point_on_arc(p1, b1, b2))
-        || (point_on_arc(p2, a1, a2) && point_on_arc(p2, b1, b2))
+    // Point furthest off the line i0-i1.
+    let axis = pts[i1] - pts[i0];
+    let (mut i2, mut best_area) = (usize::MAX, eps);
+    for c in 0..n {
+        if c == i0 || c == i1 {
+            continue;
+        }
+        let area = axis.cross(pts[c] - pts[i0]).length();
+        if area > best_area {
+            best_area = area;
+            i2 = c;
+        }
+    }
+    if i2 == usize::MAX {
+        return Vec::new(); // all points collinear
+    }
+
+    // Point furthest off the plane i0-i1-i2.
+    let normal = axis.cross(pts[i2] - pts[i0]).normalize();
+    let (mut i3, mut best_dist) = (usize::MAX, eps);
+    for d in 0..n {
+        if d == i0 || d == i1 || d == i2 {
+            continue;
+        }
+        let dist = normal.dot(pts[d] - pts[i0]).abs();
+        if dist > best_dist {
+            best_dist = dist;
+            i3 = d;
+        }
+    }
+    if i3 == usize::MAX {
+        return Vec::new(); // all points coplanar — no 3D hull
+    }
+
+    // Orient the seed faces outward relative to the tetrahedron centroid.
+    let centroid = (pts[i0] + pts[i1] + pts[i2] + pts[i3]) / 4.0;
+    let mut faces: Vec<[usize; 3]> = Vec::with_capacity(4 * n);
+    for face in [[i0, i1, i2], [i0, i1, i3], [i0, i2, i3], [i1, i2, i3]] {
+        faces.push(orient_outward(face, pts, centroid));
+    }
+
+    // --- Add the remaining points ----------------------------------------
+    let mut visible: Vec<usize> = Vec::new();
+    let mut horizon: Vec<(usize, usize)> = Vec::new();
+
+    for (p, &point) in pts.iter().enumerate() {
+        if p == i0 || p == i1 || p == i2 || p == i3 {
+            continue;
+        }
+
+        // Faces this point can "see" from outside.
+        visible.clear();
+        for (f, face) in faces.iter().enumerate() {
+            let v0 = pts[face[0]];
+            let nrm = (pts[face[1]] - v0).cross(pts[face[2]] - v0);
+            if nrm.dot(point - v0) > eps {
+                visible.push(f);
+            }
+        }
+        if visible.is_empty() {
+            continue; // inside the hull
+        }
+
+        // Horizon = directed edges of visible faces whose reverse is not also
+        // an edge of a visible face. This is what preserves manifoldness.
+        horizon.clear();
+        for &f in &visible {
+            let [a, b, c] = faces[f];
+            for edge in [(a, b), (b, c), (c, a)] {
+                let shared = visible.iter().any(|&g| {
+                    g != f && {
+                        let [x, y, z] = faces[g];
+                        [(x, y), (y, z), (z, x)].contains(&(edge.1, edge.0))
+                    }
+                });
+                if !shared {
+                    horizon.push(edge);
+                }
+            }
+        }
+
+        // Drop visible faces (descending, so indices stay valid) and cone the
+        // horizon to the new point.
+        visible.sort_unstable_by(|a, b| b.cmp(a));
+        for &f in &visible {
+            faces.swap_remove(f);
+        }
+        for &(a, b) in &horizon {
+            faces.push([a, b, p]);
+        }
+    }
+
+    faces
 }
 
-/// Check if point p lies on the arc from a to b (shorter path on great circle).
+/// Orient a triangle so its normal points away from `interior`.
 #[inline]
-fn point_on_arc(p: DVec3, a: DVec3, b: DVec3) -> bool {
-    let angle_ab = a.angle_between(b);
-    let angle_ap = a.angle_between(p);
-    let angle_pb = p.angle_between(b);
-
-    // Point is on arc if sum of angles to endpoints equals the arc angle
-    // (with some tolerance for floating point)
-    (angle_ap + angle_pb - angle_ab).abs() < 1e-6
+fn orient_outward(face: [usize; 3], pts: &[DVec3], interior: DVec3) -> [usize; 3] {
+    let [a, b, c] = face;
+    let normal = (pts[b] - pts[a]).cross(pts[c] - pts[a]);
+    if normal.dot(pts[a] - interior) < 0.0 {
+        [a, c, b]
+    } else {
+        face
+    }
 }
 
 #[cfg(test)]
